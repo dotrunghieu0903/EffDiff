@@ -308,10 +308,10 @@ If you use this reproduction package, please cite:
 
 ```bibtex
 @misc{optsd_reproduction_2025,
-  title={OptSD: The Efficiency Diffusion Models and Optimization Techniques: A Comprehensive Review},
-  author={[Trung-Hieu Do and Vinh-Tiep Nguyen]},
+  title={EffDiff: Comprehensive Benchmark of Efficiency Optimization Techniques for Diffusion Models},
+  author={[Trung-Hieu Do, Quang-Huy Che and Vinh-Tiep Nguyen]},
   year={2025},
-  howpublished={\url{https://github.com/dotrunghieu0903/OptSD}}
+  howpublished={\url{https://github.com/dotrunghieu0903/EffDiff}}
 }
 ```
 
