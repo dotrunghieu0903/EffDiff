@@ -1,6 +1,6 @@
-# OptSD Reproduction Guide
+# EffDiff Reproduction Guide
 
-This guide provides complete reproduction materials for the OptSD (Optimized Stable Diffusion) project, including configurations, seeds, prompts, and measurement scripts for independent verification.
+This guide provides complete reproduction materials for the EffDiff (Optimized Stable Diffusion) project, including configurations, seeds, prompts, and measurement scripts for independent verification.
 
 ## Table of Contents
 1. [Project Overview](#project-overview)
@@ -16,7 +16,7 @@ This guide provides complete reproduction materials for the OptSD (Optimized Sta
 
 ## Project Overview
 
-OptSD implements several optimization techniques for Stable Diffusion models:
+EffDiff implements several optimization techniques for Stable Diffusion models:
 
 - **Baseline**: Standard Stable Diffusion v1.5
 - **Quantization**: INT8 and INT4 precision reduction
@@ -36,8 +36,8 @@ OptSD implements several optimization techniques for Stable Diffusion models:
 
 1. **Create and activate conda environment:**
    ```bash
-   conda create -n optsd python=3.9
-   conda activate optsd
+   conda create -n EffDiff python=3.9
+   conda activate EffDiff
    ```
 
 2. **Install PyTorch with CUDA support:**
@@ -56,7 +56,7 @@ OptSD implements several optimization techniques for Stable Diffusion models:
 ## Project Structure
 
 ```
-OptSD/
+EffDiff/
 ├── README.md                   # Project overview
 ├── REPRODUCTION_GUIDE.md       # This file
 ├── config.json                 # Main configuration
@@ -307,7 +307,7 @@ For each experiment, measure:
 If you use this reproduction package, please cite:
 
 ```bibtex
-@misc{optsd_reproduction_2025,
+@misc{EffDiff_reproduction_2025,
   title={EffDiff: Comprehensive Benchmark of Efficiency Optimization Techniques for Diffusion Models},
   author={[Trung-Hieu Do, Quang-Huy Che and Vinh-Tiep Nguyen]},
   year={2025},
