@@ -1,0 +1,1415 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Knowledge Distillation: Tổng quan toàn diện (2006–2026)</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/theme/black.css">
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500&display=swap');
+
+  :root {
+    --r-background-color: #0a0a1a;
+    --r-main-font: 'Inter', sans-serif;
+    --r-heading-font: 'Inter', sans-serif;
+    --r-code-font: 'JetBrains Mono', monospace;
+    --r-main-font-size: 28px;
+    --r-heading1-size: 2.2em;
+    --r-heading2-size: 1.6em;
+    --r-heading3-size: 1.2em;
+    --accent-blue: #60a5fa;
+    --accent-purple: #a78bfa;
+    --accent-pink: #f472b6;
+    --accent-green: #34d399;
+    --accent-orange: #fb923c;
+    --accent-cyan: #22d3ee;
+    --accent-red: #f87171;
+    --accent-yellow: #fbbf24;
+    --card-bg: rgba(255,255,255,0.04);
+    --card-border: rgba(255,255,255,0.08);
+  }
+
+  .reveal { font-weight: 300; }
+  .reveal h1, .reveal h2, .reveal h3 { font-weight: 700; letter-spacing: -0.02em; text-transform: none; }
+  .reveal h1 { font-size: 2.4em; }
+  .reveal h2 { font-size: 1.6em; margin-bottom: 0.5em; }
+  .reveal h3 { font-size: 1.15em; }
+
+  .reveal .slides section { text-align: left; }
+  .reveal .slides section.center-slide { text-align: center; }
+
+  /* Title slide */
+  .title-slide h1 {
+    font-size: 2.6em;
+    font-weight: 900;
+    background: linear-gradient(135deg, #60a5fa, #a78bfa, #f472b6);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    line-height: 1.15;
+    margin-bottom: 0.15em;
+  }
+  .title-slide .subtitle {
+    font-size: 1.1em;
+    color: rgba(255,255,255,0.6);
+    font-weight: 300;
+    margin-bottom: 1.5em;
+  }
+  .title-slide .meta {
+    font-size: 0.65em;
+    color: rgba(255,255,255,0.35);
+  }
+
+  /* Section divider */
+  .section-divider {
+    text-align: center !important;
+  }
+  .section-divider h2 {
+    font-size: 2em;
+    font-weight: 800;
+    margin-bottom: 0.3em;
+  }
+  .section-divider .section-num {
+    font-size: 4em;
+    font-weight: 900;
+    opacity: 0.08;
+    position: absolute;
+    top: 10%;
+    right: 10%;
+  }
+  .section-divider p {
+    font-size: 0.9em;
+    color: rgba(255,255,255,0.5);
+    text-align: center;
+  }
+
+  /* Gradient text */
+  .grad-blue { background: linear-gradient(135deg, #60a5fa, #22d3ee); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
+  .grad-purple { background: linear-gradient(135deg, #a78bfa, #f472b6); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
+  .grad-green { background: linear-gradient(135deg, #34d399, #22d3ee); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
+  .grad-orange { background: linear-gradient(135deg, #fb923c, #fbbf24); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
+  .grad-pink { background: linear-gradient(135deg, #f472b6, #f87171); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
+
+  /* Cards */
+  .card {
+    background: var(--card-bg);
+    border: 1px solid var(--card-border);
+    border-radius: 12px;
+    padding: 20px 24px;
+    margin: 10px 0;
+    backdrop-filter: blur(10px);
+  }
+  .card-row {
+    display: flex;
+    gap: 16px;
+    margin: 12px 0;
+  }
+  .card-row .card { flex: 1; }
+
+  .card h4 {
+    font-size: 0.85em;
+    font-weight: 600;
+    margin: 0 0 8px 0;
+  }
+  .card p, .card li {
+    font-size: 0.7em;
+    color: rgba(255,255,255,0.7);
+    margin: 4px 0;
+    line-height: 1.5;
+  }
+  .card ul { padding-left: 1.2em; margin: 6px 0; }
+
+  /* Icon cards */
+  .icon-card {
+    display: flex;
+    align-items: flex-start;
+    gap: 16px;
+  }
+  .icon-card .icon {
+    font-size: 1.8em;
+    flex-shrink: 0;
+    width: 50px;
+    text-align: center;
+  }
+
+  /* Timeline */
+  .timeline-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 16px;
+    margin: 12px 0;
+    padding: 14px 18px;
+    background: var(--card-bg);
+    border-left: 3px solid var(--accent-blue);
+    border-radius: 0 10px 10px 0;
+  }
+  .timeline-item.era-green { border-left-color: var(--accent-green); }
+  .timeline-item.era-purple { border-left-color: var(--accent-purple); }
+  .timeline-item.era-pink { border-left-color: var(--accent-pink); }
+  .timeline-item.era-orange { border-left-color: var(--accent-orange); }
+  .timeline-item .year {
+    font-weight: 700;
+    font-size: 0.75em;
+    color: var(--accent-blue);
+    flex-shrink: 0;
+    min-width: 42px;
+  }
+  .timeline-item.era-green .year { color: var(--accent-green); }
+  .timeline-item.era-purple .year { color: var(--accent-purple); }
+  .timeline-item.era-pink .year { color: var(--accent-pink); }
+  .timeline-item.era-orange .year { color: var(--accent-orange); }
+  .timeline-item .content { flex: 1; }
+  .timeline-item .content .name { font-weight: 600; font-size: 0.8em; margin-bottom: 3px; }
+  .timeline-item .content .desc { font-size: 0.65em; color: rgba(255,255,255,0.55); line-height: 1.5; }
+
+  /* Tables */
+  .reveal table {
+    font-size: 0.58em;
+    border-collapse: separate;
+    border-spacing: 0;
+    width: 100%;
+    border-radius: 10px;
+    overflow: hidden;
+    background: var(--card-bg);
+    margin: 10px 0;
+  }
+  .reveal table th {
+    background: rgba(96, 165, 250, 0.15);
+    font-weight: 600;
+    color: var(--accent-blue);
+    padding: 10px 14px;
+    border-bottom: 1px solid rgba(255,255,255,0.08);
+    text-align: left;
+  }
+  .reveal table td {
+    padding: 8px 14px;
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+    color: rgba(255,255,255,0.75);
+  }
+  .reveal table tr:last-child td { border-bottom: none; }
+  .reveal table tr:hover td { background: rgba(255,255,255,0.03); }
+
+  /* Code blocks */
+  .reveal pre {
+    background: rgba(0,0,0,0.4);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 10px;
+    padding: 16px 20px;
+    font-size: 0.55em;
+    box-shadow: none;
+    width: 100%;
+  }
+  .reveal code {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.9em;
+  }
+  .reveal pre code {
+    color: #e2e8f0;
+    line-height: 1.6;
+  }
+
+  /* Badges */
+  .badge {
+    display: inline-block;
+    padding: 3px 10px;
+    border-radius: 20px;
+    font-size: 0.55em;
+    font-weight: 600;
+    margin: 2px 3px;
+  }
+  .badge-blue { background: rgba(96,165,250,0.2); color: var(--accent-blue); }
+  .badge-purple { background: rgba(167,139,250,0.2); color: var(--accent-purple); }
+  .badge-green { background: rgba(52,211,153,0.2); color: var(--accent-green); }
+  .badge-pink { background: rgba(244,114,182,0.2); color: var(--accent-pink); }
+  .badge-orange { background: rgba(251,146,60,0.2); color: var(--accent-orange); }
+  .badge-cyan { background: rgba(34,211,238,0.2); color: var(--accent-cyan); }
+  .badge-red { background: rgba(248,113,113,0.2); color: var(--accent-red); }
+  .badge-yellow { background: rgba(251,191,36,0.2); color: var(--accent-yellow); }
+
+  /* Highlight box */
+  .highlight-box {
+    background: linear-gradient(135deg, rgba(96,165,250,0.1), rgba(167,139,250,0.1));
+    border: 1px solid rgba(96,165,250,0.2);
+    border-radius: 12px;
+    padding: 18px 22px;
+    margin: 14px 0;
+  }
+  .highlight-box.green {
+    background: linear-gradient(135deg, rgba(52,211,153,0.1), rgba(34,211,238,0.1));
+    border-color: rgba(52,211,153,0.2);
+  }
+  .highlight-box.pink {
+    background: linear-gradient(135deg, rgba(244,114,182,0.1), rgba(248,113,113,0.1));
+    border-color: rgba(244,114,182,0.2);
+  }
+  .highlight-box.orange {
+    background: linear-gradient(135deg, rgba(251,146,60,0.1), rgba(251,191,36,0.1));
+    border-color: rgba(251,146,60,0.2);
+  }
+
+  /* List styling */
+  .reveal ul { list-style: none; padding-left: 0; }
+  .reveal ul li {
+    position: relative;
+    padding-left: 1.3em;
+    margin-bottom: 0.4em;
+    font-size: 0.82em;
+    color: rgba(255,255,255,0.8);
+    line-height: 1.5;
+  }
+  .reveal ul li::before {
+    content: '▸';
+    position: absolute;
+    left: 0;
+    color: var(--accent-blue);
+    font-weight: 700;
+  }
+
+  /* Stat grid */
+  .stat-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 14px;
+    margin: 16px 0;
+  }
+  .stat-box {
+    background: var(--card-bg);
+    border: 1px solid var(--card-border);
+    border-radius: 12px;
+    padding: 18px;
+    text-align: center;
+  }
+  .stat-box .number {
+    font-size: 2em;
+    font-weight: 800;
+    line-height: 1.1;
+  }
+  .stat-box .label {
+    font-size: 0.6em;
+    color: rgba(255,255,255,0.5);
+    margin-top: 4px;
+  }
+
+  /* Comparison grid */
+  .compare-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 14px;
+    margin: 12px 0;
+  }
+
+  /* Formula */
+  .formula-box {
+    background: rgba(0,0,0,0.3);
+    border: 1px solid rgba(167,139,250,0.3);
+    border-radius: 10px;
+    padding: 16px 22px;
+    text-align: center;
+    margin: 12px 0;
+    font-size: 0.85em;
+    color: var(--accent-purple);
+    font-family: 'JetBrains Mono', monospace;
+  }
+
+  /* Progress bar style */
+  .progress-bar {
+    height: 6px;
+    border-radius: 3px;
+    background: rgba(255,255,255,0.06);
+    margin: 6px 0;
+    overflow: hidden;
+  }
+  .progress-bar .fill {
+    height: 100%;
+    border-radius: 3px;
+    transition: width 0.3s;
+  }
+
+  /* Star rating */
+  .stars { color: var(--accent-yellow); font-size: 0.8em; }
+
+  /* Flow diagram */
+  .flow-diagram {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    margin: 16px 0;
+    flex-wrap: wrap;
+  }
+  .flow-box {
+    background: var(--card-bg);
+    border: 1px solid var(--card-border);
+    border-radius: 10px;
+    padding: 10px 18px;
+    font-size: 0.7em;
+    font-weight: 500;
+    text-align: center;
+  }
+  .flow-arrow {
+    font-size: 1.2em;
+    color: rgba(255,255,255,0.3);
+  }
+
+  /* Slide footer */
+  .slide-footer {
+    position: absolute;
+    bottom: 16px;
+    left: 40px;
+    font-size: 0.4em;
+    color: rgba(255,255,255,0.2);
+  }
+
+  /* Background decorations */
+  .bg-glow {
+    position: absolute;
+    width: 400px;
+    height: 400px;
+    border-radius: 50%;
+    filter: blur(120px);
+    opacity: 0.07;
+    pointer-events: none;
+  }
+  .bg-glow.blue { background: #60a5fa; top: -100px; right: -100px; }
+  .bg-glow.purple { background: #a78bfa; bottom: -100px; left: -100px; }
+  .bg-glow.pink { background: #f472b6; top: -100px; left: -100px; }
+
+  /* Two columns */
+  .two-col {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 24px;
+    align-items: start;
+  }
+  .three-col {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 14px;
+    align-items: start;
+  }
+
+  /* Small text */
+  .small { font-size: 0.65em; color: rgba(255,255,255,0.5); }
+  .tiny { font-size: 0.5em; color: rgba(255,255,255,0.35); }
+
+  /* Emphasis */
+  .em-blue { color: var(--accent-blue); font-weight: 600; }
+  .em-purple { color: var(--accent-purple); font-weight: 600; }
+  .em-green { color: var(--accent-green); font-weight: 600; }
+  .em-pink { color: var(--accent-pink); font-weight: 600; }
+  .em-orange { color: var(--accent-orange); font-weight: 600; }
+
+  /* Animated gradient border */
+  .glow-border {
+    border: 1px solid transparent;
+    background-clip: padding-box;
+    position: relative;
+  }
+  .glow-border::before {
+    content: '';
+    position: absolute;
+    inset: -1px;
+    border-radius: 13px;
+    background: linear-gradient(135deg, rgba(96,165,250,0.3), rgba(167,139,250,0.3), rgba(244,114,182,0.3));
+    z-index: -1;
+  }
+
+  /* Priority markers */
+  .priority-high { border-left: 3px solid var(--accent-red); }
+  .priority-med { border-left: 3px solid var(--accent-yellow); }
+  .priority-low { border-left: 3px solid var(--accent-green); }
+
+  /* Override reveal defaults */
+  .reveal p { font-size: 0.82em; line-height: 1.6; color: rgba(255,255,255,0.75); }
+  .reveal strong { font-weight: 700; color: rgba(255,255,255,0.95); }
+  .reveal em { color: var(--accent-blue); font-style: normal; font-weight: 500; }
+
+  /* Tree diagram styling */
+  .tree-container {
+    background: rgba(0,0,0,0.3);
+    border: 1px solid var(--card-border);
+    border-radius: 12px;
+    padding: 18px 24px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.55em;
+    line-height: 1.7;
+    color: rgba(255,255,255,0.8);
+  }
+  .tree-container .tree-root { color: var(--accent-blue); font-weight: 700; }
+  .tree-container .tree-branch { color: var(--accent-purple); font-weight: 600; }
+  .tree-container .tree-leaf { color: rgba(255,255,255,0.6); }
+
+  .reveal .slide-number { font-family: 'Inter', sans-serif; font-weight: 500; }
+
+  /* Override for nested lists */
+  .reveal .card ul li::before { color: var(--accent-purple); }
+</style>
+</head>
+<body>
+
+<div class="reveal">
+<div class="slides">
+
+<!-- ========== SLIDE 1: TITLE ========== -->
+<section class="center-slide title-slide" data-background-gradient="radial-gradient(ellipse at 30% 20%, rgba(96,165,250,0.08) 0%, transparent 50%), radial-gradient(ellipse at 70% 80%, rgba(167,139,250,0.08) 0%, transparent 50%), #0a0a1a">
+  <div>
+    <h1>Knowledge Distillation</h1>
+    <p class="subtitle">Tổng quan toàn diện từ 2006 đến 2026</p>
+    <div style="display:flex;gap:10px;justify-content:center;margin-bottom:2em;">
+      <span class="badge badge-blue">Model Compression</span>
+      <span class="badge badge-purple">Diffusion Models</span>
+      <span class="badge badge-green">Few-Step Generation</span>
+      <span class="badge badge-pink">SOTA 2025</span>
+    </div>
+    <p class="meta">OptSD Project — Distillation Module &nbsp;|&nbsp; Updated March 2026</p>
+  </div>
+</section>
+
+<!-- ========== SLIDE 2: AGENDA ========== -->
+<section data-background-gradient="radial-gradient(ellipse at 80% 20%, rgba(96,165,250,0.06) 0%, transparent 50%), #0a0a1a">
+  <h2><span class="grad-blue">Nội dung trình bày</span></h2>
+  <div class="card-row">
+    <div class="card" style="border-left:3px solid var(--accent-blue);">
+      <h4 style="color:var(--accent-blue);">01 — Giới thiệu</h4>
+      <p>Knowledge Distillation là gì? Tại sao quan trọng?</p>
+    </div>
+    <div class="card" style="border-left:3px solid var(--accent-purple);">
+      <h4 style="color:var(--accent-purple);">02 — Lịch sử</h4>
+      <p>Lộ trình phát triển 2006–2026</p>
+    </div>
+  </div>
+  <div class="card-row">
+    <div class="card" style="border-left:3px solid var(--accent-green);">
+      <h4 style="color:var(--accent-green);">03 — Phân loại</h4>
+      <p>Taxonomy các kỹ thuật KD</p>
+    </div>
+    <div class="card" style="border-left:3px solid var(--accent-pink);">
+      <h4 style="color:var(--accent-pink);">04 — Highlight 2023–2026</h4>
+      <p>Các kỹ thuật SOTA nổi bật</p>
+    </div>
+  </div>
+  <div class="card-row">
+    <div class="card" style="border-left:3px solid var(--accent-orange);">
+      <h4 style="color:var(--accent-orange);">05 — So sánh</h4>
+      <p>Đối chiếu với module distilled.py</p>
+    </div>
+    <div class="card" style="border-left:3px solid var(--accent-cyan);">
+      <h4 style="color:var(--accent-cyan);">06 — Khuyến nghị</h4>
+      <p>Hướng mở rộng & cải thiện</p>
+    </div>
+  </div>
+</section>
+
+<!-- ========== SECTION DIVIDER: INTRO ========== -->
+<section class="center-slide section-divider" data-background-gradient="radial-gradient(ellipse at 50% 50%, rgba(96,165,250,0.1) 0%, transparent 60%), #0a0a1a">
+  <span class="section-num">01</span>
+  <h2><span class="grad-blue">Giới thiệu</span></h2>
+  <p>Knowledge Distillation là gì?</p>
+</section>
+
+<!-- ========== SLIDE 3: WHAT IS KD ========== -->
+<section data-background-gradient="radial-gradient(ellipse at 20% 80%, rgba(96,165,250,0.06) 0%, transparent 50%), #0a0a1a">
+  <h2>Knowledge Distillation <span class="em-blue">(KD)</span></h2>
+  <p>Kỹ thuật nén mô hình: <strong>Student</strong> nhỏ hơn học bắt chước <strong>Teacher</strong> lớn hơn</p>
+
+  <div class="flow-diagram" style="margin:20px 0;">
+    <div class="flow-box" style="border-color:var(--accent-purple);color:var(--accent-purple);font-size:0.8em;">
+      🧠 Teacher<br><span style="font-size:0.75em;opacity:0.6;">Large Model</span>
+    </div>
+    <div class="flow-arrow">→ <span style="font-size:0.6em;color:var(--accent-blue);">knowledge</span> →</div>
+    <div class="flow-box" style="border-color:var(--accent-green);color:var(--accent-green);font-size:0.8em;">
+      📚 Student<br><span style="font-size:0.75em;opacity:0.6;">Compact Model</span>
+    </div>
+  </div>
+
+  <div class="stat-grid" style="grid-template-columns:repeat(3,1fr);">
+    <div class="stat-box">
+      <div class="number grad-blue">↓</div>
+      <div class="label">Giảm kích thước<br>→ Edge deployment</div>
+    </div>
+    <div class="stat-box">
+      <div class="number grad-green">⚡</div>
+      <div class="label">Tăng tốc inference<br>→ Giảm latency</div>
+    </div>
+    <div class="stat-box">
+      <div class="number grad-purple">≈</div>
+      <div class="label">Giữ chất lượng<br>→ Student ≈ Teacher</div>
+    </div>
+  </div>
+
+  <div class="highlight-box" style="text-align:center;">
+    <p style="margin:0;font-size:0.75em;">Trong <strong>Stable Diffusion / Diffusion Models</strong>: hàng tỷ tham số, 20–50 inference steps → KD đặc biệt quan trọng</p>
+  </div>
+</section>
+
+<!-- ========== SECTION DIVIDER: HISTORY ========== -->
+<section class="center-slide section-divider" data-background-gradient="radial-gradient(ellipse at 50% 50%, rgba(167,139,250,0.1) 0%, transparent 60%), #0a0a1a">
+  <span class="section-num">02</span>
+  <h2><span class="grad-purple">Lịch sử phát triển</span></h2>
+  <p>Từ nền tảng đến kỷ nguyên Diffusion Distillation</p>
+</section>
+
+<!-- ========== SLIDE 4: FOUNDATION 2006-2014 ========== -->
+<section data-background-gradient="radial-gradient(ellipse at 80% 20%, rgba(96,165,250,0.06) 0%, transparent 50%), #0a0a1a">
+  <h2><span class="grad-blue">2006–2014:</span> Nền tảng</h2>
+
+  <div class="timeline-item">
+    <div class="year">2006</div>
+    <div class="content">
+      <div class="name">Model Compression <span class="badge badge-blue">Buciluă et al., KDD</span></div>
+      <div class="desc">Đầu tiên đề xuất dùng ensemble model (teacher) để huấn luyện model nhỏ (student). Student học từ pseudo-labels.</div>
+    </div>
+  </div>
+
+  <div class="timeline-item" style="border-left-color:var(--accent-purple);">
+    <div class="year" style="color:var(--accent-purple);">2014</div>
+    <div class="content">
+      <div class="name">Dark Knowledge <span class="badge badge-purple">Hinton et al. — Paper nền tảng</span></div>
+      <div class="desc">Giới thiệu <strong>soft targets</strong> — softmax outputs với temperature scaling thay vì hard labels.</div>
+    </div>
+  </div>
+
+  <div class="formula-box">
+    L = α · L<sub>CE</sub>(y, ŷ) + (1−α) · T² · KL( σ(z<sub>t</sub>/T) ‖ σ(z<sub>s</sub>/T) )
+  </div>
+
+  <p class="small" style="text-align:center;">Công thức kinh điển của Hinton — Nền tảng cho tất cả KD methods sau này</p>
+</section>
+
+<!-- ========== SLIDE 5: 2015-2019 ========== -->
+<section data-background-gradient="radial-gradient(ellipse at 20% 80%, rgba(52,211,153,0.06) 0%, transparent 50%), #0a0a1a">
+  <h2><span class="grad-green">2015–2019:</span> Mở rộng & Đa dạng hóa</h2>
+
+  <div class="two-col">
+    <div>
+      <div class="timeline-item era-green" style="margin:8px 0;padding:10px 14px;">
+        <div class="year">2015</div>
+        <div class="content">
+          <div class="name">FitNets</div>
+          <div class="desc">Feature-level KD: match intermediate feature maps</div>
+        </div>
+      </div>
+      <div class="timeline-item era-green" style="margin:8px 0;padding:10px 14px;">
+        <div class="year">2017</div>
+        <div class="content">
+          <div class="name">Attention Transfer</div>
+          <div class="desc">Chuyển attention maps từ teacher sang student</div>
+        </div>
+      </div>
+      <div class="timeline-item era-green" style="margin:8px 0;padding:10px 14px;">
+        <div class="year">2018</div>
+        <div class="content">
+          <div class="name">Born-Again Networks</div>
+          <div class="desc">Student cùng kiến trúc, retrained → performance tốt hơn</div>
+        </div>
+      </div>
+    </div>
+    <div>
+      <div class="timeline-item era-green" style="margin:8px 0;padding:10px 14px;">
+        <div class="year">2019</div>
+        <div class="content">
+          <div class="name">Relational KD</div>
+          <div class="desc">Match quan hệ (distances, angles) giữa data points</div>
+        </div>
+      </div>
+      <div class="timeline-item era-green" style="margin:8px 0;padding:10px 14px;">
+        <div class="year">2019</div>
+        <div class="content">
+          <div class="name">Contrastive KD</div>
+          <div class="desc">Contrastive learning + KD: mutual information</div>
+        </div>
+      </div>
+      <div class="timeline-item era-green" style="margin:8px 0;padding:10px 14px;">
+        <div class="year">2019</div>
+        <div class="content">
+          <div class="name">TinyBERT</div>
+          <div class="desc">KD đa tầng cho Transformers: embedding + attention + hidden</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ========== SLIDE 6: 2020-2022 ========== -->
+<section data-background-gradient="radial-gradient(ellipse at 80% 80%, rgba(251,146,60,0.06) 0%, transparent 50%), #0a0a1a">
+  <h2><span class="grad-orange">2020–2022:</span> KD cho Generative Models</h2>
+
+  <div class="timeline-item era-orange" style="padding:12px 16px;">
+    <div class="year">2020</div>
+    <div class="content">
+      <div class="name">GAN Compression <span class="badge badge-orange">CVPR 2020</span></div>
+      <div class="desc">Nén generator bằng matching features & outputs giữa teacher-student GAN</div>
+    </div>
+  </div>
+
+  <div class="timeline-item era-orange" style="padding:12px 16px;">
+    <div class="year">2021</div>
+    <div class="content">
+      <div class="name">KD of DDPM <span class="badge badge-orange">Đầu tiên cho Diffusion</span></div>
+      <div class="desc">Student 1 step: noise → image, học từ teacher multi-step. Mở đầu cho diffusion distillation.</div>
+    </div>
+  </div>
+
+  <div class="timeline-item era-pink" style="padding:12px 16px;border-left-width:4px;">
+    <div class="year" style="color:var(--accent-pink);">2022</div>
+    <div class="content">
+      <div class="name" style="font-size:0.9em;">Progressive Distillation <span class="badge badge-pink">ICLR 2022 — Bước đột phá</span></div>
+      <div class="desc">Student predict N/2 steps ← Teacher N steps (DDIM). Halving: 1024→512→...→4→2→1</div>
+    </div>
+  </div>
+
+  <div class="timeline-item era-orange" style="padding:12px 16px;">
+    <div class="year">2022</div>
+    <div class="content">
+      <div class="name">Guidance Distillation <span class="badge badge-orange">CVPR 2023</span></div>
+      <div class="desc">Distill CFG vào student → không cần 2× forward pass → giảm 50% compute</div>
+    </div>
+  </div>
+</section>
+
+<!-- ========== SLIDE 7: 2023-2026 OVERVIEW ========== -->
+<section class="center-slide section-divider" data-background-gradient="radial-gradient(ellipse at 50% 50%, rgba(244,114,182,0.12) 0%, transparent 60%), #0a0a1a">
+  <span class="section-num">⭐</span>
+  <h2><span class="grad-pink">2023–2026</span></h2>
+  <p style="font-size:1.1em;">Kỷ nguyên Diffusion Distillation — Giai đoạn bùng nổ</p>
+  <div style="display:flex;gap:10px;justify-content:center;margin-top:1em;">
+    <span class="badge badge-pink">1-Step Generation</span>
+    <span class="badge badge-purple">Adversarial Training</span>
+    <span class="badge badge-cyan">Consistency Models</span>
+    <span class="badge badge-green">Real-time</span>
+  </div>
+</section>
+
+<!-- ========== SLIDE 8: 2023-2026 TIMELINE ========== -->
+<section data-background-gradient="radial-gradient(ellipse at 20% 20%, rgba(244,114,182,0.06) 0%, transparent 50%), #0a0a1a">
+  <h2><span class="grad-pink">2023–2026:</span> Key Milestones</h2>
+
+  <div class="two-col" style="font-size:0.85em;">
+    <div>
+      <div class="timeline-item era-pink" style="padding:8px 12px;margin:6px 0;">
+        <div class="year">2023</div>
+        <div class="content">
+          <div class="name">Consistency Models</div>
+          <div class="desc">Self-consistency: any ODE point → x₀. 1–2 steps.</div>
+        </div>
+      </div>
+      <div class="timeline-item era-pink" style="padding:8px 12px;margin:6px 0;">
+        <div class="year">2023</div>
+        <div class="content">
+          <div class="name">LCM / LCM-LoRA</div>
+          <div class="desc">Consistency Models trong latent space. 1–4 steps.</div>
+        </div>
+      </div>
+      <div class="timeline-item era-pink" style="padding:8px 12px;margin:6px 0;">
+        <div class="year">2023</div>
+        <div class="content">
+          <div class="name">SDXL-Turbo (ADD)</div>
+          <div class="desc">Adversarial + Distillation. Real-time 1–4 steps.</div>
+        </div>
+      </div>
+      <div class="timeline-item era-pink" style="padding:8px 12px;margin:6px 0;">
+        <div class="year">2023</div>
+        <div class="content">
+          <div class="name">InstaFlow</div>
+          <div class="desc">Rectified Flow → single-step T2I.</div>
+        </div>
+      </div>
+    </div>
+    <div>
+      <div class="timeline-item era-purple" style="padding:8px 12px;margin:6px 0;">
+        <div class="year" style="color:var(--accent-purple);">2024</div>
+        <div class="content">
+          <div class="name">DMD / DMD2</div>
+          <div class="desc">Distribution-level matching. SOTA FID one-step.</div>
+        </div>
+      </div>
+      <div class="timeline-item era-purple" style="padding:8px 12px;margin:6px 0;">
+        <div class="year" style="color:var(--accent-purple);">2024</div>
+        <div class="content">
+          <div class="name">SDXL-Lightning</div>
+          <div class="desc">Progressive + Adversarial. LoRA adapters. 1–8 steps.</div>
+        </div>
+      </div>
+      <div class="timeline-item era-purple" style="padding:8px 12px;margin:6px 0;">
+        <div class="year" style="color:var(--accent-purple);">2024</div>
+        <div class="content">
+          <div class="name">Hyper-SD</div>
+          <div class="desc">Segmented CD + Human preference reward.</div>
+        </div>
+      </div>
+      <div class="timeline-item" style="padding:8px 12px;margin:6px 0;border-left-color:var(--accent-cyan);">
+        <div class="year" style="color:var(--accent-cyan);">2025</div>
+        <div class="content">
+          <div class="name">SANA-Sprint</div>
+          <div class="desc">CTCD + LADD. 7.8 FPS trên laptop GPU!</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ========== SECTION DIVIDER: CLASSIFICATION ========== -->
+<section class="center-slide section-divider" data-background-gradient="radial-gradient(ellipse at 50% 50%, rgba(52,211,153,0.1) 0%, transparent 60%), #0a0a1a">
+  <span class="section-num">03</span>
+  <h2><span class="grad-green">Phân loại kỹ thuật KD</span></h2>
+  <p>Taxonomy theo kiến thức, dữ liệu và mục tiêu</p>
+</section>
+
+<!-- ========== SLIDE 9: CLASSIFICATION TREE ========== -->
+<section data-background-gradient="radial-gradient(ellipse at 80% 80%, rgba(52,211,153,0.06) 0%, transparent 50%), #0a0a1a">
+  <h2>Phân loại theo <span class="em-green">thông tin transfer</span></h2>
+
+  <div class="tree-container">
+    <span class="tree-root">Knowledge Distillation</span><br>
+    ├── <span class="tree-branch">Response-based (Output-level)</span><br>
+    │&nbsp;&nbsp;&nbsp;├── <span class="tree-leaf">Soft Label KD [Hinton 2015]</span><br>
+    │&nbsp;&nbsp;&nbsp;├── <span class="tree-leaf">Noise Prediction Matching (Diffusion)</span><br>
+    │&nbsp;&nbsp;&nbsp;└── <span class="tree-leaf">Guidance Distillation [Meng 2022]</span><br>
+    │<br>
+    ├── <span class="tree-branch">Feature-based (Intermediate)</span><br>
+    │&nbsp;&nbsp;&nbsp;├── <span class="tree-leaf">FitNets [Romero 2015] &nbsp; • Attention Transfer [Zagoruyko 2017]</span><br>
+    │&nbsp;&nbsp;&nbsp;└── <span class="tree-leaf">TinyBERT multi-layer [Jiao 2020]</span><br>
+    │<br>
+    ├── <span class="tree-branch">Relation-based</span><br>
+    │&nbsp;&nbsp;&nbsp;├── <span class="tree-leaf">Relational KD [Park 2019] &nbsp; • Contrastive KD [Tian 2020]</span><br>
+    │&nbsp;&nbsp;&nbsp;└── <span class="tree-leaf">Probabilistic KT [Passalis 2018]</span><br>
+    │<br>
+    └── <span class="tree-branch">Trajectory-based (Diffusion-specific)</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;├── <span class="tree-leaf">Progressive Distillation &nbsp; • Consistency Models</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;├── <span class="tree-leaf">Distribution Matching &nbsp; • Adversarial Diffusion Distillation</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;└── <span class="tree-leaf">Rectified Flow Distillation</span>
+  </div>
+</section>
+
+<!-- ========== SLIDE 10: CLASSIFICATION BY DATA & STEPS ========== -->
+<section data-background-gradient="radial-gradient(ellipse at 20% 20%, rgba(52,211,153,0.06) 0%, transparent 50%), #0a0a1a">
+  <h2>Phân loại theo <span class="em-green">dữ liệu</span> & <span class="em-blue">số steps</span></h2>
+
+  <div class="two-col">
+    <div>
+      <h3 style="color:var(--accent-green);font-size:0.9em;">Theo yêu cầu dữ liệu</h3>
+      <div class="card" style="border-left:3px solid var(--accent-blue);margin:8px 0;">
+        <h4 style="color:var(--accent-blue);">Data-driven</h4>
+        <p>Cần training data (captions, images)</p>
+        <p style="opacity:0.5;">FitNets, Progressive Distill., LCM</p>
+      </div>
+      <div class="card" style="border-left:3px solid var(--accent-green);margin:8px 0;">
+        <h4 style="color:var(--accent-green);">Data-free</h4>
+        <p>Dùng synthetic samples từ teacher</p>
+        <p style="opacity:0.5;">BOOT, Self-distillation</p>
+      </div>
+      <div class="card" style="border-left:3px solid var(--accent-purple);margin:8px 0;">
+        <h4 style="color:var(--accent-purple);">Score-based</h4>
+        <p>Dùng score function trực tiếp</p>
+        <p style="opacity:0.5;">SDS, VSD, Diff-Instruct</p>
+      </div>
+    </div>
+    <div>
+      <h3 style="color:var(--accent-blue);font-size:0.9em;">Theo inference steps</h3>
+      <table style="font-size:0.85em;">
+        <tr>
+          <th>Steps</th>
+          <th>Kỹ thuật</th>
+        </tr>
+        <tr>
+          <td><span class="em-pink">1 step</span></td>
+          <td>InstaFlow, DMD2, SwiftBrush, SANA-Sprint</td>
+        </tr>
+        <tr>
+          <td><span class="em-orange">1–4 steps</span></td>
+          <td>LCM, SDXL-Turbo, Lightning, Hyper-SD, Flux.1-schnell</td>
+        </tr>
+        <tr>
+          <td><span class="em-blue">4–8 steps</span></td>
+          <td>Progressive Distill., TCD, Consistency Models</td>
+        </tr>
+        <tr>
+          <td><span class="em-green">Flexible</span></td>
+          <td>CTM, Guidance Distillation</td>
+        </tr>
+      </table>
+    </div>
+  </div>
+</section>
+
+<!-- ========== SECTION DIVIDER: HIGHLIGHTS ========== -->
+<section class="center-slide section-divider" data-background-gradient="radial-gradient(ellipse at 50% 50%, rgba(244,114,182,0.12) 0%, transparent 60%), #0a0a1a">
+  <span class="section-num">04</span>
+  <h2><span class="grad-pink">Kỹ thuật nổi bật</span></h2>
+  <p>Highlight 2023–2026</p>
+</section>
+
+<!-- ========== SLIDE 11: LCM ========== -->
+<section data-background-gradient="radial-gradient(ellipse at 80% 20%, rgba(96,165,250,0.08) 0%, transparent 50%), #0a0a1a">
+  <h2><span style="font-size:1.3em;">⭐</span> Latent Consistency Models <span class="badge badge-blue">2023</span></h2>
+  <p><em>Luo et al.</em> — arXiv:2310.04378</p>
+
+  <div class="two-col">
+    <div>
+      <div class="highlight-box">
+        <ul>
+          <li>Áp dụng <strong>Consistency Models</strong> trong <span class="em-blue">latent space</span> của Stable Diffusion</li>
+          <li><strong>1–4 step</strong> generation với chất lượng gần multi-step</li>
+          <li><strong>LCM-LoRA</strong>: lightweight adapter, plug-and-play</li>
+          <li>Widely adopted: ComfyUI, A1111, Diffusers</li>
+        </ul>
+      </div>
+    </div>
+    <div>
+      <div class="stat-grid" style="grid-template-columns:repeat(2,1fr);">
+        <div class="stat-box">
+          <div class="number grad-blue">1–4</div>
+          <div class="label">Inference Steps</div>
+        </div>
+        <div class="stat-box">
+          <div class="number grad-green">~0.6s</div>
+          <div class="label">Per Image (SDXL)</div>
+        </div>
+      </div>
+      <div class="card" style="margin-top:10px;">
+        <h4 style="color:var(--accent-purple);">Key Idea</h4>
+        <p>Consistency mapping: bất kỳ điểm nào trên ODE trajectory → cùng x₀ trong latent space</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ========== SLIDE 12: ADD / SDXL-Turbo ========== -->
+<section data-background-gradient="radial-gradient(ellipse at 20% 80%, rgba(244,114,182,0.08) 0%, transparent 50%), #0a0a1a">
+  <h2><span style="font-size:1.3em;">⭐</span> Adversarial Diffusion Distillation <span class="badge badge-pink">2023</span></h2>
+  <p><em>Sauer et al.</em> — SDXL-Turbo — arXiv:2311.17042</p>
+
+  <div class="two-col">
+    <div>
+      <div class="highlight-box pink">
+        <ul>
+          <li>Kết hợp <strong>adversarial training</strong> (discriminator) + <strong>distillation loss</strong></li>
+          <li>Student kiến trúc giống teacher, predict ít steps</li>
+          <li><strong>Real-time generation</strong> với 1–4 steps trên consumer GPU</li>
+          <li>Nền tảng cho SDXL-Turbo commercial product</li>
+        </ul>
+      </div>
+    </div>
+    <div>
+      <div class="flow-diagram" style="flex-direction:column;gap:12px;">
+        <div class="flow-box" style="width:100%;border-color:var(--accent-pink);">
+          <span class="em-pink">Teacher</span> (multi-step) → Distillation Loss
+        </div>
+        <div class="flow-arrow" style="transform:rotate(90deg);">↓</div>
+        <div class="flow-box" style="width:100%;border-color:var(--accent-green);">
+          <span class="em-green">Student</span> (1–4 steps) ← Adversarial Loss
+        </div>
+        <div class="flow-arrow" style="transform:rotate(90deg);">↑</div>
+        <div class="flow-box" style="width:100%;border-color:var(--accent-orange);">
+          <span class="em-orange">Discriminator</span> — Real vs Generated
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ========== SLIDE 13: DMD/DMD2 ========== -->
+<section data-background-gradient="radial-gradient(ellipse at 80% 80%, rgba(167,139,250,0.08) 0%, transparent 50%), #0a0a1a">
+  <h2><span style="font-size:1.3em;">⭐</span> Distribution Matching Distillation <span class="badge badge-purple">2024</span></h2>
+  <p><em>Yin et al.</em> — DMD / DMD2</p>
+
+  <div class="card-row">
+    <div class="card" style="border-left:3px solid var(--accent-purple);">
+      <h4 style="color:var(--accent-purple);">DMD (CVPR 2024)</h4>
+      <ul>
+        <li>Match toàn bộ <strong>output distribution</strong></li>
+        <li>Regression + distribution matching loss</li>
+        <li>One-step generation từ teacher multi-step</li>
+      </ul>
+    </div>
+    <div class="card" style="border-left:3px solid var(--accent-cyan);">
+      <h4 style="color:var(--accent-cyan);">DMD2 (NeurIPS 2024)</h4>
+      <ul>
+        <li>Loại bỏ regression loss</li>
+        <li><strong>GAN-style loss</strong> + two-time-scale update</li>
+        <li><strong>FID state-of-the-art</strong> cho one-step</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="stat-grid" style="grid-template-columns:repeat(3,1fr);margin-top:10px;">
+    <div class="stat-box">
+      <div class="number grad-purple">22.4</div>
+      <div class="label">FID ↓ (SD1.5, 1-step)</div>
+    </div>
+    <div class="stat-box">
+      <div class="number grad-cyan" style="background:linear-gradient(135deg,#22d3ee,#60a5fa);-webkit-background-clip:text;-webkit-text-fill-color:transparent;">1000×</div>
+      <div class="label">Nhanh hơn teacher</div>
+    </div>
+    <div class="stat-box">
+      <div class="number grad-green">~0.1s</div>
+      <div class="label">Inference time</div>
+    </div>
+  </div>
+</section>
+
+<!-- ========== SLIDE 14: SDXL-Lightning + Hyper-SD ========== -->
+<section data-background-gradient="radial-gradient(ellipse at 20% 20%, rgba(251,146,60,0.08) 0%, transparent 50%), #0a0a1a">
+  <h2><span style="font-size:1.1em;">⭐</span> SDXL-Lightning & Hyper-SD <span class="badge badge-orange">2024</span></h2>
+
+  <div class="compare-grid">
+    <div class="card" style="border-top:3px solid var(--accent-orange);">
+      <h4 style="color:var(--accent-orange);font-size:0.95em;">SDXL-Lightning</h4>
+      <p><em>Lin et al., 2024</em></p>
+      <ul>
+        <li><strong>Progressive + Adversarial</strong>: chia khoảng thời gian → segments</li>
+        <li><strong>LoRA</strong> & full UNet checkpoints</li>
+        <li>Variants: <strong>1, 2, 4, 8 step</strong></li>
+        <li>Open-source, dễ integrate</li>
+      </ul>
+      <div style="margin-top:8px;">
+        <span class="badge badge-orange">FID ~24.0</span>
+        <span class="badge badge-green">~0.5s</span>
+      </div>
+    </div>
+    <div class="card" style="border-top:3px solid var(--accent-yellow);">
+      <h4 style="color:var(--accent-yellow);font-size:0.95em;">Hyper-SD</h4>
+      <p><em>Ren et al., 2024</em></p>
+      <ul>
+        <li><strong>Trajectory Segmented CD</strong>: phân chia ODE theo quality regions</li>
+        <li>Kết hợp <strong>human preference scoring</strong></li>
+        <li>SOTA: FID + CLIP Score + Human Preference</li>
+        <li>Hỗ trợ SD1.5, SDXL, SD3</li>
+      </ul>
+      <div style="margin-top:8px;">
+        <span class="badge badge-yellow">FID ~23.5</span>
+        <span class="badge badge-green">~0.3s</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ========== SLIDE 15: SANA-Sprint + APT ========== -->
+<section data-background-gradient="radial-gradient(ellipse at 80% 20%, rgba(34,211,238,0.08) 0%, transparent 50%), #0a0a1a">
+  <h2><span style="font-size:1.1em;">⭐</span> SANA-Sprint & APT <span class="badge badge-cyan">2025</span></h2>
+
+  <div class="compare-grid">
+    <div class="card glow-border" style="border-top:3px solid var(--accent-cyan);">
+      <h4 style="color:var(--accent-cyan);font-size:0.95em;">🚀 SANA-Sprint — Nhanh nhất hiện tại</h4>
+      <p><em>NVIDIA/MIT, 2025</em></p>
+      <ul>
+        <li><strong>CTCD</strong>: Continuous-Time Consistency Distillation</li>
+        <li><strong>LADD</strong>: Latent Adversarial Diffusion Distillation</li>
+        <li>3 giai đoạn: pretrain → CTCD → LADD fine-tuning</li>
+      </ul>
+      <div class="stat-grid" style="grid-template-columns:repeat(2,1fr);margin-top:8px;">
+        <div class="stat-box" style="padding:10px;">
+          <div class="number" style="font-size:1.6em;background:linear-gradient(135deg,#22d3ee,#60a5fa);-webkit-background-clip:text;-webkit-text-fill-color:transparent;">7.8 FPS</div>
+          <div class="label">1024×1024 laptop GPU</div>
+        </div>
+        <div class="stat-box" style="padding:10px;">
+          <div class="number" style="font-size:1.6em;" class="grad-green">~20.0</div>
+          <div class="label">FID ↓ (SOTA)</div>
+        </div>
+      </div>
+    </div>
+    <div class="card" style="border-top:3px solid var(--accent-green);">
+      <h4 style="color:var(--accent-green);font-size:0.95em;">⚡ Adversarial Post-Training (APT)</h4>
+      <p><em>Lin et al., 2025</em></p>
+      <ul>
+        <li><strong>Post-training</strong> — không cần retrain from scratch</li>
+        <li>Fine-tune bằng adversarial objective → giảm steps</li>
+        <li><strong>Cheaper</strong>: ít data, ít compute</li>
+        <li>Áp dụng lên bất kỳ pretrained diffusion model</li>
+      </ul>
+      <div style="margin-top:12px;">
+        <span class="badge badge-green">Low Cost</span>
+        <span class="badge badge-blue">Universal</span>
+        <span class="badge badge-purple">1–4 Steps</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ========== SLIDE 16: Future trends ========== -->
+<section data-background-gradient="radial-gradient(ellipse at 50% 50%, rgba(167,139,250,0.08) 0%, transparent 50%), #0a0a1a">
+  <h2><span class="grad-purple">Xu hướng 2025–2026</span></h2>
+
+  <div class="three-col">
+    <div class="card" style="border-top:3px solid var(--accent-purple);">
+      <h4 style="color:var(--accent-purple);">Consistency Flow Matching</h4>
+      <ul>
+        <li>Hợp nhất Consistency Models + Flow Matching</li>
+        <li>Continuous normalizing flows</li>
+        <li>Nền tảng cho Flux, SD3</li>
+        <li>T2I, T2V, T2-3D</li>
+      </ul>
+    </div>
+    <div class="card" style="border-top:3px solid var(--accent-pink);">
+      <h4 style="color:var(--accent-pink);">Multi-Reward Guided KD</h4>
+      <ul>
+        <li>KD + RLHF/DPO rewards</li>
+        <li>Tối ưu đồng thời speed & alignment</li>
+        <li>Human preference scoring</li>
+        <li>Hyper-SD approach</li>
+      </ul>
+    </div>
+    <div class="card" style="border-top:3px solid var(--accent-green);">
+      <h4 style="color:var(--accent-green);">Architecture-Aware KD</h4>
+      <ul>
+        <li>Student = Pruned + NAS</li>
+        <li>KD để recover quality</li>
+        <li>Structured pruning + distillation</li>
+        <li>SnapGen approach</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="highlight-box" style="text-align:center;margin-top:16px;">
+    <p style="margin:0;font-size:0.75em;">
+      Trend chung: <strong>One-step generation</strong> + <strong>Adversarial training</strong> + <strong>Human preference alignment</strong> → Real-time, high-quality
+    </p>
+  </div>
+</section>
+
+<!-- ========== SECTION DIVIDER: COMPARISON ========== -->
+<section class="center-slide section-divider" data-background-gradient="radial-gradient(ellipse at 50% 50%, rgba(251,146,60,0.1) 0%, transparent 60%), #0a0a1a">
+  <span class="section-num">05</span>
+  <h2><span class="grad-orange">So sánh với distilled.py</span></h2>
+  <p>Module hiện tại implement những gì?</p>
+</section>
+
+<!-- ========== SLIDE 17: distilled.py overview ========== -->
+<section data-background-gradient="radial-gradient(ellipse at 80% 80%, rgba(251,146,60,0.06) 0%, transparent 50%), #0a0a1a">
+  <h2>Các kỹ thuật trong <span class="em-orange">distilled.py</span></h2>
+
+  <div class="card-row">
+    <div class="card" style="border-left:3px solid var(--accent-blue);flex:1;">
+      <h4 style="color:var(--accent-blue);">① KD Loss Output</h4>
+      <p><strong>Output-level KD</strong> (Hinton adapted)</p>
+      <div class="formula-box" style="font-size:0.75em;margin:6px 0;padding:8px;">
+        L = α·MSE(s, target) + (1−α)·T²·MSE(s, t)
+      </div>
+      <p>Match noise predictions (ε) giữa teacher-student</p>
+    </div>
+    <div class="card" style="border-left:3px solid var(--accent-purple);flex:1;">
+      <h4 style="color:var(--accent-purple);">② KD Loss Feature</h4>
+      <p><strong>Feature-level KD</strong> (FitNets)</p>
+      <p>Forward hooks + projection layers khi dim khác nhau</p>
+      <p>Match: attn, ff, mid_block features</p>
+    </div>
+  </div>
+  <div class="card-row">
+    <div class="card" style="border-left:3px solid var(--accent-green);flex:1;">
+      <h4 style="color:var(--accent-green);">③ KD Loss Attention Transfer</h4>
+      <p><strong>Attention Transfer</strong> (Zagoruyko 2017)</p>
+      <p>Normalized attention maps (softmax) → MSE loss</p>
+    </div>
+    <div class="card" style="border-left:3px solid var(--accent-pink);flex:1;">
+      <h4 style="color:var(--accent-pink);">④ Progressive Distillation Loss</h4>
+      <p><strong>Progressive Distillation</strong> (Salimans 2022)</p>
+      <p>Student 1 step = Teacher 2 DDIM steps. Halving.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ========== SLIDE 18: Comparison table ========== -->
+<section data-background-gradient="radial-gradient(ellipse at 20% 20%, rgba(251,146,60,0.06) 0%, transparent 50%), #0a0a1a">
+  <h2>Bảng so sánh: <span class="em-orange">distilled.py</span> vs SOTA</h2>
+
+  <table>
+    <tr>
+      <th>Kỹ thuật</th>
+      <th>Năm</th>
+      <th>Loại</th>
+      <th>Steps</th>
+      <th>distilled.py?</th>
+    </tr>
+    <tr>
+      <td><strong>Soft Label KD</strong></td>
+      <td>2015</td>
+      <td><span class="badge badge-blue">Response</span></td>
+      <td>—</td>
+      <td style="color:var(--accent-green);">✅ KDLossOutput</td>
+    </tr>
+    <tr>
+      <td><strong>FitNets</strong></td>
+      <td>2015</td>
+      <td><span class="badge badge-purple">Feature</span></td>
+      <td>—</td>
+      <td style="color:var(--accent-green);">✅ KDLossFeature</td>
+    </tr>
+    <tr>
+      <td><strong>Attention Transfer</strong></td>
+      <td>2017</td>
+      <td><span class="badge badge-purple">Feature</span></td>
+      <td>—</td>
+      <td style="color:var(--accent-green);">✅ KDLossAttentionTransfer</td>
+    </tr>
+    <tr>
+      <td><strong>Progressive Distillation</strong></td>
+      <td>2022</td>
+      <td><span class="badge badge-pink">Trajectory</span></td>
+      <td>N/2→1</td>
+      <td style="color:var(--accent-green);">✅ ProgressiveDistillLoss</td>
+    </tr>
+    <tr style="opacity:0.6;">
+      <td>Guidance Distillation</td>
+      <td>2022</td>
+      <td><span class="badge badge-blue">Response</span></td>
+      <td>Flexible</td>
+      <td style="color:var(--accent-red);">❌</td>
+    </tr>
+    <tr style="opacity:0.6;">
+      <td>LCM / Consistency Models</td>
+      <td>2023</td>
+      <td><span class="badge badge-pink">Trajectory</span></td>
+      <td>1–4</td>
+      <td style="color:var(--accent-red);">❌</td>
+    </tr>
+    <tr style="opacity:0.6;">
+      <td>ADD / SDXL-Turbo</td>
+      <td>2023</td>
+      <td><span class="badge badge-orange">Adversarial</span></td>
+      <td>1–4</td>
+      <td style="color:var(--accent-red);">❌</td>
+    </tr>
+    <tr style="opacity:0.6;">
+      <td>DMD / DMD2</td>
+      <td>2024</td>
+      <td><span class="badge badge-cyan">Distribution</span></td>
+      <td>1</td>
+      <td style="color:var(--accent-red);">❌</td>
+    </tr>
+    <tr style="opacity:0.6;">
+      <td>SANA-Sprint (CTCD+LADD)</td>
+      <td>2025</td>
+      <td><span class="badge badge-cyan">CTCD</span></td>
+      <td>1</td>
+      <td style="color:var(--accent-red);">❌</td>
+    </tr>
+  </table>
+</section>
+
+<!-- ========== SLIDE 19: Performance ========== -->
+<section data-background-gradient="radial-gradient(ellipse at 80% 20%, rgba(52,211,153,0.06) 0%, transparent 50%), #0a0a1a">
+  <h2>Benchmark <span class="em-green">Performance</span></h2>
+
+  <table>
+    <tr>
+      <th>Method</th>
+      <th>Model</th>
+      <th>Steps</th>
+      <th>FID ↓</th>
+      <th>CLIP ↑</th>
+      <th>Speed</th>
+    </tr>
+    <tr>
+      <td>SDXL <span class="badge badge-blue" style="font-size:0.8em;">baseline</span></td>
+      <td>SDXL</td>
+      <td>50</td>
+      <td>~23</td>
+      <td>~0.32</td>
+      <td>~5s</td>
+    </tr>
+    <tr>
+      <td>Progressive Distill. <span class="badge badge-orange" style="font-size:0.8em;">distilled.py</span></td>
+      <td>SDXL</td>
+      <td>4–8</td>
+      <td>~28–35</td>
+      <td>~0.30</td>
+      <td>~0.8–1.5s</td>
+    </tr>
+    <tr>
+      <td>Output KD <span class="badge badge-orange" style="font-size:0.8em;">distilled.py</span></td>
+      <td>SDXL</td>
+      <td>30</td>
+      <td>~25–30</td>
+      <td>~0.31</td>
+      <td>~4s</td>
+    </tr>
+    <tr style="background:rgba(96,165,250,0.08);">
+      <td><strong>LCM-LoRA</strong></td>
+      <td>SDXL</td>
+      <td>4</td>
+      <td><span class="em-blue">~24.5</span></td>
+      <td>~0.31</td>
+      <td>~0.6s</td>
+    </tr>
+    <tr style="background:rgba(244,114,182,0.08);">
+      <td><strong>SDXL-Turbo</strong></td>
+      <td>SDXL</td>
+      <td>1–4</td>
+      <td><span class="em-pink">~26.2</span></td>
+      <td>~0.31</td>
+      <td>~0.2–0.5s</td>
+    </tr>
+    <tr style="background:rgba(251,146,60,0.08);">
+      <td><strong>SDXL-Lightning</strong></td>
+      <td>SDXL</td>
+      <td>4</td>
+      <td><span class="em-orange">~24.0</span></td>
+      <td>~0.32</td>
+      <td>~0.5s</td>
+    </tr>
+    <tr style="background:rgba(251,191,36,0.08);">
+      <td><strong>Hyper-SD</strong></td>
+      <td>SDXL</td>
+      <td>1–4</td>
+      <td><span style="color:var(--accent-yellow);font-weight:700;">~23.5</span></td>
+      <td><strong>~0.32</strong></td>
+      <td>~0.3–0.5s</td>
+    </tr>
+    <tr style="background:rgba(167,139,250,0.08);">
+      <td><strong>DMD2</strong></td>
+      <td>SD1.5</td>
+      <td>1</td>
+      <td><span class="em-purple">~22.4</span></td>
+      <td>~0.31</td>
+      <td>~0.1s</td>
+    </tr>
+    <tr style="background:rgba(34,211,238,0.12);">
+      <td><strong>SANA-Sprint</strong> 🏆</td>
+      <td>SANA 1.6B</td>
+      <td>1</td>
+      <td style="color:var(--accent-cyan);font-weight:800;">~20.0</td>
+      <td><strong>~0.33</strong></td>
+      <td style="color:var(--accent-cyan);font-weight:800;">~0.13s</td>
+    </tr>
+  </table>
+</section>
+
+<!-- ========== SECTION DIVIDER: RECOMMENDATIONS ========== -->
+<section class="center-slide section-divider" data-background-gradient="radial-gradient(ellipse at 50% 50%, rgba(34,211,238,0.1) 0%, transparent 60%), #0a0a1a">
+  <span class="section-num">06</span>
+  <h2><span class="grad-green">Khuyến nghị mở rộng</span></h2>
+  <p>Hướng cải thiện cho distilled.py</p>
+</section>
+
+<!-- ========== SLIDE 20: RECOMMENDATIONS ========== -->
+<section data-background-gradient="radial-gradient(ellipse at 20% 80%, rgba(34,211,238,0.06) 0%, transparent 50%), #0a0a1a">
+  <h2>Khuyến nghị mở rộng <span class="em-green">distilled.py</span></h2>
+
+  <div class="card priority-high" style="margin:10px 0;padding:16px 20px;">
+    <div style="display:flex;justify-content:space-between;align-items:center;">
+      <h4 style="color:var(--accent-red);margin:0;">🔴 Ưu tiên cao</h4>
+    </div>
+    <div class="card-row" style="margin:8px 0 0 0;">
+      <div>
+        <p><strong>Consistency Distillation (LCD/LCM)</strong></p>
+        <p>SOTA few-step generation, có code reference. Độ khó: Trung bình.</p>
+      </div>
+      <div>
+        <p><strong>Guidance Distillation</strong></p>
+        <p>Giảm 50% compute cho CFG, orthogonal với methods khác. Độ khó: Dễ.</p>
+      </div>
+    </div>
+  </div>
+
+  <div class="card priority-med" style="margin:10px 0;padding:16px 20px;">
+    <div style="display:flex;justify-content:space-between;align-items:center;">
+      <h4 style="color:var(--accent-yellow);margin:0;">🟡 Ưu tiên trung bình</h4>
+    </div>
+    <div class="card-row" style="margin:8px 0 0 0;">
+      <div>
+        <p><strong>Adversarial Loss (ADD-style)</strong></p>
+        <p>Cải thiện visual quality cho 1–4 step. Cần discriminator.</p>
+      </div>
+      <div>
+        <p><strong>CTCD (Continuous-Time CD)</strong></p>
+        <p>Mới nhất, tốt cho rectified flow (Flux, SD3).</p>
+      </div>
+    </div>
+  </div>
+
+  <div class="card priority-low" style="margin:10px 0;padding:16px 20px;">
+    <div style="display:flex;justify-content:space-between;align-items:center;">
+      <h4 style="color:var(--accent-green);margin:0;">🟢 Ưu tiên thấp</h4>
+    </div>
+    <div class="card-row" style="margin:8px 0 0 0;">
+      <div>
+        <p><strong>Distribution Matching (DMD2)</strong></p>
+        <p>Best FID, nhưng cần GAN training phức tạp.</p>
+      </div>
+      <div>
+        <p><strong>Reward-guided KD</strong></p>
+        <p>Align human preference, cần reward model.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ========== SLIDE 21: SUMMARY ========== -->
+<section data-background-gradient="radial-gradient(ellipse at 50% 50%, rgba(96,165,250,0.08) 0%, transparent 50%), radial-gradient(ellipse at 80% 80%, rgba(244,114,182,0.06) 0%, transparent 50%), #0a0a1a">
+  <h2><span class="grad-blue">Tóm tắt</span></h2>
+
+  <div class="two-col">
+    <div>
+      <div class="highlight-box" style="margin-bottom:12px;">
+        <h4 style="color:var(--accent-blue);font-size:0.85em;margin:0 0 8px 0;">📌 Key Takeaways</h4>
+        <ul>
+          <li><strong>KD</strong> là kỹ thuật nén mô hình cốt lõi cho Diffusion Models</li>
+          <li>Giai đoạn <strong>2023–2026</strong>: bùng nổ với one-step generation</li>
+          <li><strong>distilled.py</strong> đã implement 4 kỹ thuật nền tảng quan trọng</li>
+          <li>Cơ hội lớn: thêm <strong>LCM, Guidance Distill., ADD</strong></li>
+        </ul>
+      </div>
+    </div>
+    <div>
+      <div class="highlight-box green">
+        <h4 style="color:var(--accent-green);font-size:0.85em;margin:0 0 8px 0;">🎯 Xu hướng chính</h4>
+        <ul>
+          <li><strong>One-step</strong> generation là mục tiêu cuối cùng</li>
+          <li><strong>Adversarial training</strong> + KD = combo mạnh nhất</li>
+          <li><strong>Consistency Models</strong> → framework thống nhất</li>
+          <li><strong>Human preference</strong> alignment ngày càng quan trọng</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <div style="text-align:center;margin-top:20px;">
+    <div style="display:flex;gap:8px;justify-content:center;flex-wrap:wrap;">
+      <span class="badge badge-blue">Response-based ✅</span>
+      <span class="badge badge-purple">Feature-based ✅</span>
+      <span class="badge badge-green">Attention ✅</span>
+      <span class="badge badge-pink">Progressive ✅</span>
+      <span class="badge badge-orange">Consistency 🔜</span>
+      <span class="badge badge-cyan">Adversarial 🔜</span>
+    </div>
+  </div>
+</section>
+
+<!-- ========== SLIDE 22: THANK YOU ========== -->
+<section class="center-slide" data-background-gradient="radial-gradient(ellipse at 30% 30%, rgba(96,165,250,0.1) 0%, transparent 50%), radial-gradient(ellipse at 70% 70%, rgba(167,139,250,0.1) 0%, transparent 50%), #0a0a1a">
+  <div>
+    <h1 style="font-size:2.5em;font-weight:900;background:linear-gradient(135deg,#60a5fa,#a78bfa,#f472b6);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;">Cảm ơn!</h1>
+    <p style="font-size:1em;color:rgba(255,255,255,0.5);margin-top:0.5em;">Knowledge Distillation for Diffusion Models</p>
+    <div style="margin-top:2em;">
+      <p class="small">OptSD Project — Distillation Module</p>
+      <p class="tiny">March 2026 &nbsp;|&nbsp; 37+ References &nbsp;|&nbsp; 20+ KD Techniques Covered</p>
+    </div>
+  </div>
+</section>
+
+</div><!-- .slides -->
+</div><!-- .reveal -->
+
+<script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+<script>
+  Reveal.initialize({
+    hash: true,
+    slideNumber: 'c/t',
+    width: 1280,
+    height: 720,
+    margin: 0.08,
+    transition: 'slide',
+    transitionSpeed: 'default',
+    backgroundTransition: 'fade',
+    center: false,
+    controls: true,
+    controlsTutorial: true,
+    progress: true,
+    keyboard: true,
+    overview: true,
+    touch: true,
+  });
+</script>
+</body>
+</html>
