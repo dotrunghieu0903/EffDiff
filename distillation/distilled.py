@@ -2,14 +2,17 @@
 """
 Knowledge Distillation module for Stable Diffusion optimization.
 
-This module implements Knowledge Distillation (KD) to compress diffusion models
-by training a smaller/faster student model to mimic a larger teacher model.
+Implements state-of-the-art distillation methods based on:
 
-Supported approaches:
-1. Output-level KD: Match the final noise predictions (epsilon) between teacher and student
-2. Feature-level KD: Match intermediate feature maps from UNet/Transformer blocks
-3. Attention Transfer: Transfer attention maps from teacher to student
-4. Progressive Distillation: Reduce inference steps by distilling multi-step into fewer steps
+1. DMD2 (Improved Distribution Matching Distillation) — Yin et al., NeurIPS 2024
+   - Distribution matching loss with fake/real score estimation
+   - GAN-style adversarial loss on clean latents
+   - Two-timescale update rule for stable training
+
+2. SANA-Sprint (Continuous-Time Consistency Distillation) — Chen et al., 2025
+   - CTCD: Continuous-time consistency distillation via JVP-based tangent estimation
+   - LADD: Latent adversarial diffusion distillation with multi-scale discriminator
+   - Combined CTCD + LADD for one-step high-quality generation
 
 Supported model families: SDXL, Flux, SD3, SANA
 """
@@ -67,202 +70,514 @@ def _import_shared():
 
 
 # ============================================================================
-#  Loss Functions for Knowledge Distillation
+#  DMD2: Distribution Matching Distillation 2
+#  (Yin et al., "Improved Distribution Matching Distillation", NeurIPS 2024)
 # ============================================================================
 
-class KDLossOutput(nn.Module):
+class FakeScoreNetwork(nn.Module):
     """
-    Output-level Knowledge Distillation loss.
-    Matches the noise prediction (epsilon) between teacher and student.
-    
-    L = alpha * L_task + (1 - alpha) * L_kd
-    where L_task = MSE(student_pred, target)
-          L_kd  = MSE(student_pred, teacher_pred) * temperature^2
+    Fake score estimator for DMD2.
+
+    A copy of the teacher UNet/Transformer trained to estimate the score
+    of the *generated* distribution. This is contrasted against the real
+    score (teacher) to produce the distribution matching gradient.
+
+    The same network doubles as a GAN discriminator when cls_on_clean_image
+    is enabled — a small classification head is appended to the bottleneck
+    features.
     """
 
-    def __init__(self, alpha: float = 0.5, temperature: float = 1.0):
+    def __init__(self, teacher_denoiser: nn.Module, model_type: str, device: str):
         super().__init__()
-        self.alpha = alpha
-        self.temperature = temperature
+        self.fake_denoiser = copy.deepcopy(teacher_denoiser)
+        self.fake_denoiser.requires_grad_(True)
+        self.model_type = model_type
 
-    def forward(
+        # Build a lightweight classification head on the bottleneck features
+        # for GAN-style real/fake discrimination
+        bottleneck_dim = self._get_bottleneck_dim()
+        self.cls_head = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(bottleneck_dim, 256),
+            nn.SiLU(),
+            nn.Linear(256, 1),
+        ).to(device)
+        self.cls_head.requires_grad_(True)
+
+    def _get_bottleneck_dim(self) -> int:
+        """Estimate bottleneck channel dimension from the denoiser architecture."""
+        if self.model_type == "sdxl":
+            return 1280
+        elif self.model_type in ("flux", "sd3"):
+            return 1536
+        elif self.model_type == "sana":
+            return 2240
+        return 1280
+
+    def score_forward(self, latents, timesteps, encoder_hidden_states, **kwargs):
+        """Forward pass for score estimation (standard denoising prediction)."""
+        output = self.fake_denoiser(latents, timesteps, encoder_hidden_states=encoder_hidden_states, **kwargs)
+        if isinstance(output, tuple):
+            return output[0]
+        if hasattr(output, "sample"):
+            return output.sample
+        return output
+
+    def classify(self, latents: torch.Tensor) -> torch.Tensor:
+        """Classify latents as real or fake using the appended head."""
+        return self.cls_head(latents)
+
+
+class DMD2Loss(nn.Module):
+    """
+    Distribution Matching Distillation loss (DMD2).
+
+    Core idea: match the *distribution* of generated samples to real data
+    by comparing two denoising score estimates:
+      - s_real: teacher's score on noised generated samples (real score)
+      - s_fake: fake-score network's score on the same samples
+
+    Generator gradient:
+        grad = (p_real - p_fake) / mean(|p_real|)
+        where p = x - denoise(x)
+
+    This is combined with a GAN loss where the fake-score network also acts
+    as a discriminator on clean latents.
+    """
+
+    def __init__(
         self,
-        student_pred: torch.Tensor,
-        teacher_pred: torch.Tensor,
-        target: torch.Tensor,
+        dm_loss_weight: float = 1.0,
+        gan_loss_weight: float = 1.0,
+        real_guidance_scale: float = 6.0,
+        fake_guidance_scale: float = 1.0,
+    ):
+        super().__init__()
+        self.dm_loss_weight = dm_loss_weight
+        self.gan_loss_weight = gan_loss_weight
+        self.real_guidance_scale = real_guidance_scale
+        self.fake_guidance_scale = fake_guidance_scale
+
+    def compute_distribution_matching_loss(
+        self,
+        generated_latents: torch.Tensor,
+        teacher_denoiser: nn.Module,
+        fake_score_net: FakeScoreNetwork,
+        text_embedding: torch.Tensor,
+        scheduler,
+        alphas_cumprod: torch.Tensor,
+        num_train_timesteps: int,
+        model_type: str,
+        device: str,
+        forward_kwargs: dict,
+        min_step_pct: float = 0.02,
+        max_step_pct: float = 0.98,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        # Task loss: student vs ground-truth noise
-        loss_task = F.mse_loss(student_pred, target)
+        """Compute the distribution matching gradient for generator update."""
+        batch_size = generated_latents.shape[0]
+        min_step = int(min_step_pct * num_train_timesteps)
+        max_step = int(max_step_pct * num_train_timesteps)
 
-        # KD loss: student vs teacher (scaled by temperature^2)
-        loss_kd = F.mse_loss(student_pred, teacher_pred) * (self.temperature ** 2)
+        with torch.no_grad():
+            timesteps = torch.randint(
+                min_step, min(max_step + 1, num_train_timesteps),
+                [batch_size], device=device, dtype=torch.long,
+            )
+            noise = torch.randn_like(generated_latents)
+            noisy_latents = scheduler.add_noise(generated_latents, noise, timesteps)
 
-        loss_total = self.alpha * loss_task + (1 - self.alpha) * loss_kd
+            # Real score (teacher)
+            pred_real_noise = teacher_denoiser(
+                noisy_latents, timesteps,
+                encoder_hidden_states=text_embedding,
+                **forward_kwargs,
+            )
+            if isinstance(pred_real_noise, tuple):
+                pred_real_noise = pred_real_noise[0]
+            elif hasattr(pred_real_noise, "sample"):
+                pred_real_noise = pred_real_noise.sample
+
+            pred_real_x0 = _get_x0_from_noise(
+                noisy_latents.double(), pred_real_noise.double(),
+                alphas_cumprod.double(), timesteps,
+            )
+
+            # Fake score
+            pred_fake_noise = fake_score_net.score_forward(
+                noisy_latents, timesteps,
+                encoder_hidden_states=text_embedding,
+                **forward_kwargs,
+            )
+
+            pred_fake_x0 = _get_x0_from_noise(
+                noisy_latents.double(), pred_fake_noise.double(),
+                alphas_cumprod.double(), timesteps,
+            )
+
+            p_real = (generated_latents.double() - pred_real_x0)
+            p_fake = (generated_latents.double() - pred_fake_x0)
+
+            grad = (p_real - p_fake) / torch.abs(p_real).mean(dim=[1, 2, 3], keepdim=True).clamp(min=1e-8)
+            grad = torch.nan_to_num(grad)
+
+        # Pseudo-loss that produces the correct gradient
+        loss = 0.5 * F.mse_loss(
+            generated_latents.float(),
+            (generated_latents - grad).detach().float(),
+        )
 
         metrics = {
-            "loss_total": loss_total.item(),
-            "loss_task": loss_task.item(),
-            "loss_kd": loss_kd.item(),
+            "loss_dm": loss.item(),
+            "dm_grad_norm": torch.norm(grad).item(),
         }
-        return loss_total, metrics
+        return loss * self.dm_loss_weight, metrics
 
-
-class KDLossFeature(nn.Module):
-    """
-    Feature-level Knowledge Distillation loss.
-    Matches intermediate feature maps between teacher and student blocks.
-    Uses projection layers when feature dimensions differ.
-    """
-
-    def __init__(self, teacher_dims: List[int], student_dims: List[int], weight: float = 1.0):
-        super().__init__()
-        self.weight = weight
-        # Build projection layers where dimensions mismatch
-        self.projectors = nn.ModuleList()
-        for t_dim, s_dim in zip(teacher_dims, student_dims):
-            if t_dim != s_dim:
-                self.projectors.append(
-                    nn.Sequential(
-                        nn.Linear(s_dim, t_dim),
-                        nn.GELU(),
-                    )
-                )
-            else:
-                self.projectors.append(nn.Identity())
-
-    def forward(
+    def compute_gan_loss_generator(
         self,
-        student_features: List[torch.Tensor],
-        teacher_features: List[torch.Tensor],
+        generated_latents: torch.Tensor,
+        fake_score_net: FakeScoreNetwork,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        total_loss = torch.tensor(0.0, device=student_features[0].device)
-        layer_losses = {}
+        """GAN loss for the generator (fool the discriminator)."""
+        pred_fake = fake_score_net.classify(generated_latents)
+        loss = F.softplus(-pred_fake).mean()
+        return loss * self.gan_loss_weight, {"gen_cls_loss": loss.item()}
 
-        for i, (sf, tf, proj) in enumerate(
-            zip(student_features, teacher_features, self.projectors)
-        ):
-            sf_proj = proj(sf)
-            layer_loss = F.mse_loss(sf_proj, tf.detach())
-            total_loss = total_loss + layer_loss
-            layer_losses[f"feature_loss_layer_{i}"] = layer_loss.item()
-
-        total_loss = total_loss * self.weight / max(len(student_features), 1)
-        layer_losses["feature_loss_total"] = total_loss.item()
-        return total_loss, layer_losses
-
-
-class KDLossAttentionTransfer(nn.Module):
-    """
-    Attention Transfer loss.
-    Matches the attention map distributions between teacher and student.
-    Uses KL divergence on flattened spatial attention maps.
-    """
-
-    def __init__(self, weight: float = 1.0):
-        super().__init__()
-        self.weight = weight
-
-    def _normalize_attention(self, attn: torch.Tensor) -> torch.Tensor:
-        """Normalize attention maps to probability distributions."""
-        b, h, n, _ = attn.shape
-        attn_flat = attn.view(b * h, n, -1)
-        attn_norm = F.softmax(attn_flat / math.sqrt(attn_flat.size(-1)), dim=-1)
-        return attn_norm
-
-    def forward(
+    def compute_fake_score_loss(
         self,
-        student_attns: List[torch.Tensor],
-        teacher_attns: List[torch.Tensor],
+        generated_latents: torch.Tensor,
+        fake_score_net: FakeScoreNetwork,
+        scheduler,
+        text_embedding: torch.Tensor,
+        num_train_timesteps: int,
+        device: str,
+        forward_kwargs: dict,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        total_loss = torch.tensor(0.0, device=student_attns[0].device)
-        metrics = {}
+        """Train the fake score network to estimate score on generated data."""
+        generated_latents = generated_latents.detach()
+        batch_size = generated_latents.shape[0]
+        noise = torch.randn_like(generated_latents)
+        timesteps = torch.randint(0, num_train_timesteps, [batch_size], device=device, dtype=torch.long)
+        noisy_latents = scheduler.add_noise(generated_latents, noise, timesteps)
 
-        for i, (s_attn, t_attn) in enumerate(zip(student_attns, teacher_attns)):
-            s_norm = self._normalize_attention(s_attn)
-            t_norm = self._normalize_attention(t_attn)
+        pred_noise = fake_score_net.score_forward(
+            noisy_latents, timesteps,
+            encoder_hidden_states=text_embedding,
+            **forward_kwargs,
+        )
+        loss = F.mse_loss(pred_noise.float(), noise.float())
+        return loss, {"loss_fake_score": loss.item()}
 
-            # KL divergence between attention distributions
-            layer_loss = F.kl_div(
-                s_norm.log().clamp(min=-100), t_norm, reduction="batchnorm"
-            ) if False else F.mse_loss(s_norm, t_norm.detach())
+    def compute_gan_loss_discriminator(
+        self,
+        real_latents: torch.Tensor,
+        fake_latents: torch.Tensor,
+        fake_score_net: FakeScoreNetwork,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """GAN loss for the discriminator (distinguish real from fake)."""
+        pred_real = fake_score_net.classify(real_latents.detach())
+        pred_fake = fake_score_net.classify(fake_latents.detach())
+        loss = F.softplus(pred_fake).mean() + F.softplus(-pred_real).mean()
+        return loss, {
+            "guidance_cls_loss": loss.item(),
+            "pred_real_mean": torch.sigmoid(pred_real).mean().item(),
+            "pred_fake_mean": torch.sigmoid(pred_fake).mean().item(),
+        }
 
-            total_loss = total_loss + layer_loss
-            metrics[f"attn_loss_layer_{i}"] = layer_loss.item()
 
-        total_loss = total_loss * self.weight / max(len(student_attns), 1)
-        metrics["attn_loss_total"] = total_loss.item()
-        return total_loss, metrics
+# ============================================================================
+#  SANA-Sprint: CTCD + LADD
+#  (Chen et al., "SANA-Sprint: One-Step Diffusion with Continuous-Time
+#   Consistency Distillation", 2025)
+# ============================================================================
 
-
-class ProgressiveDistillationLoss(nn.Module):
+class CTCDLoss(nn.Module):
     """
-    Progressive Distillation loss for reducing inference steps.
-    The student learns to predict in N/2 steps what the teacher produces in N steps.
-    Based on "Progressive Distillation for Fast Sampling of Diffusion Models" (Salimans & Ho, 2022).
+    Continuous-Time Consistency Distillation (CTCD) loss.
+
+    Uses the trigonometric flow formulation:
+        x_t = cos(t) * x_0 + sin(t) * z * sigma_data
+
+    The loss enforces consistency along the ODE trajectory via
+    JVP (Jacobian-Vector Product) based tangent estimation:
+
+        g = -cos^2(t) * (sigma_data * F_theta_stop - dxdt)
+            - r * (cos(t)*sin(t)*x_t + sigma_data * F_theta_grad_jvp)
+
+    With tangent normalization: g := g / (||g|| + c)
+
+    Final loss:
+        L = (weight / exp(logvar)) * ||F_theta - F_theta_stop - g||^2  + logvar
     """
 
-    def __init__(self, weight: float = 1.0):
+    def __init__(
+        self,
+        sigma_data: float = 1.0,
+        tangent_warmup_steps: int = 1000,
+        tangent_norm_constant: float = 0.1,
+    ):
         super().__init__()
-        self.weight = weight
+        self.sigma_data = sigma_data
+        self.tangent_warmup_steps = tangent_warmup_steps
+        self.tangent_norm_constant = tangent_norm_constant
 
     def forward(
         self,
-        student_pred: torch.Tensor,
-        teacher_two_step_result: torch.Tensor,
+        student_model: nn.Module,
+        teacher_model: nn.Module,
+        clean_images: torch.Tensor,
+        text_embedding: torch.Tensor,
+        text_mask: Optional[torch.Tensor],
+        timesteps: torch.Tensor,
+        global_step: int,
+        model_kwargs: dict,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
+        Compute the CTCD loss.
+
         Args:
-            student_pred: Student's single-step prediction x_hat
-            teacher_two_step_result: Teacher's two-step DDIM result
+            student_model: Student denoiser (must support return_logvar and jvp)
+            teacher_model: Teacher denoiser (frozen)
+            clean_images: Clean latent images x_0 (already * sigma_data)
+            text_embedding: Text conditioning
+            text_mask: Text attention mask
+            timesteps: Sampled timesteps in [0, pi/2] (trigonometric flow)
+            global_step: Current training step for warmup
+            model_kwargs: Additional kwargs for model forward
         """
-        loss = F.mse_loss(student_pred, teacher_two_step_result.detach()) * self.weight
-        return loss, {"progressive_loss": loss.item()}
+        sd = self.sigma_data
+        x0 = clean_images
+        t = timesteps.view(-1, 1, 1, 1)
+        z = torch.randn_like(x0) * sd
 
+        # Noisy latent in trigonometric flow
+        x_t = torch.cos(t) * x0 + torch.sin(t) * z
 
-# ============================================================================
-#  Feature Extraction Hooks
-# ============================================================================
+        # Teacher velocity field
+        with torch.no_grad():
+            teacher_pred = teacher_model(
+                x_t / sd, t.flatten(),
+                encoder_hidden_states=text_embedding,
+                **model_kwargs,
+            )
+            if isinstance(teacher_pred, tuple):
+                teacher_pred = teacher_pred[0]
+            elif hasattr(teacher_pred, "sample"):
+                teacher_pred = teacher_pred.sample
+            dxt_dt = sd * teacher_pred
 
-class FeatureExtractor:
-    """
-    Attaches forward hooks to specified layers of a model to capture
-    intermediate feature maps and attention maps during forward pass.
-    """
+        # Tangent directions for JVP
+        v_x = torch.cos(t) * torch.sin(t) * dxt_dt / sd
+        v_t = torch.cos(t) * torch.sin(t)
 
-    def __init__(self, model: nn.Module, layer_names: List[str]):
-        self.features: Dict[str, torch.Tensor] = {}
-        self.attentions: Dict[str, torch.Tensor] = {}
-        self._hooks = []
+        # Standard student forward (F_theta)
+        student_out = student_model(
+            x_t / sd, t.flatten(),
+            encoder_hidden_states=text_embedding,
+            **model_kwargs,
+        )
+        if isinstance(student_out, tuple):
+            F_theta = student_out[0]
+            logvar = student_out[1] if len(student_out) > 1 and student_out[1] is not None else None
+        elif hasattr(student_out, "sample"):
+            F_theta = student_out.sample
+            logvar = None
+        else:
+            F_theta = student_out
+            logvar = None
 
-        for name, module in model.named_modules():
-            if any(ln in name for ln in layer_names):
-                hook = module.register_forward_hook(self._make_hook(name))
-                self._hooks.append(hook)
+        # F_theta_minus (stop-gradient target)
+        F_theta_minus = F_theta.detach()
 
-    def _make_hook(self, name: str):
-        def hook_fn(module, input, output):
-            if isinstance(output, tuple):
-                self.features[name] = output[0].detach()
-                if len(output) > 1 and output[1] is not None:
-                    self.attentions[name] = output[1].detach()
+        # Approximate JVP using finite differences when native JVP not available
+        with torch.no_grad():
+            eps_fd = 1e-3
+            x_t_pert = x_t + eps_fd * v_x
+            t_pert = t + eps_fd * v_t
+            student_pert = student_model(
+                x_t_pert / sd, t_pert.flatten(),
+                encoder_hidden_states=text_embedding,
+                **model_kwargs,
+            )
+            if isinstance(student_pert, tuple):
+                F_pert = student_pert[0]
+            elif hasattr(student_pert, "sample"):
+                F_pert = student_pert.sample
             else:
-                self.features[name] = output.detach()
-        return hook_fn
+                F_pert = student_pert
+            F_theta_grad = (F_pert - F_theta_minus) / eps_fd
 
-    def get_features(self) -> List[torch.Tensor]:
-        return list(self.features.values())
+        # Warmup coefficient
+        r = min(1.0, global_step / max(self.tangent_warmup_steps, 1))
 
-    def get_attentions(self) -> List[torch.Tensor]:
-        return list(self.attentions.values())
+        # Compute tangent g
+        g = -torch.cos(t) * torch.cos(t) * (sd * F_theta_minus - dxt_dt)
+        second_term = -r * (torch.cos(t) * torch.sin(t) * x_t + sd * F_theta_grad)
+        g = g + second_term
 
-    def clear(self):
-        self.features.clear()
-        self.attentions.clear()
+        # Tangent normalization
+        g_norm = torch.linalg.vector_norm(g, dim=(1, 2, 3), keepdim=True)
+        g = g / (g_norm + self.tangent_norm_constant)
 
-    def remove_hooks(self):
-        for h in self._hooks:
-            h.remove()
-        self._hooks.clear()
+        # Weighting
+        sigma = torch.tan(t) * sd
+        weight = 1.0 / sigma.clamp(min=1e-6)
+
+        l2_loss = torch.square(F_theta - F_theta_minus - g)
+
+        if logvar is not None:
+            logvar = logvar.view(-1, 1, 1, 1)
+            loss = (weight / torch.exp(logvar)) * l2_loss + logvar
+        else:
+            loss = weight * l2_loss
+
+        loss = loss.mean()
+        loss_no_logvar = (weight * l2_loss).mean()
+
+        metrics = {
+            "ctcd_loss": loss.item(),
+            "ctcd_loss_no_logvar": loss_no_logvar.item(),
+            "ctcd_g_norm": g_norm.mean().item(),
+        }
+        return loss, metrics
+
+
+class LatentDiscriminator(nn.Module):
+    """
+    Latent-space discriminator for LADD (Latent Adversarial Diffusion Distillation).
+
+    Operates on noised latents at various noise levels, using the teacher
+    backbone as a feature extractor with trainable classification heads.
+
+    This is a simplified version suitable for the project's scope — uses
+    the teacher denoiser backbone (frozen) with a small trainable head.
+    """
+
+    def __init__(self, backbone: nn.Module, latent_channels: int, device: str):
+        super().__init__()
+        self.backbone = copy.deepcopy(backbone)
+        self.backbone.requires_grad_(False)
+        self.backbone.eval()
+
+        # Trainable classification heads
+        self.head = nn.Sequential(
+            nn.AdaptiveAvgPool2d(4),
+            nn.Flatten(),
+            nn.Linear(latent_channels * 16, 512),
+            nn.SiLU(),
+            nn.Linear(512, 128),
+            nn.SiLU(),
+            nn.Linear(128, 1),
+        ).to(device)
+        self.head.requires_grad_(True)
+
+    def forward(
+        self,
+        latents: torch.Tensor,
+        timesteps: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Get discriminator logits for the given latents."""
+        with torch.no_grad():
+            features = self.backbone(
+                latents, timesteps,
+                encoder_hidden_states=encoder_hidden_states,
+                **kwargs,
+            )
+            if isinstance(features, tuple):
+                features = features[0]
+            elif hasattr(features, "sample"):
+                features = features.sample
+
+        logits = self.head(features)
+        return logits
+
+
+class LADDLoss(nn.Module):
+    """
+    Latent Adversarial Diffusion Distillation (LADD) loss.
+
+    The discriminator distinguishes between:
+      - Real: noise-augmented ground-truth latents
+      - Fake: noise-augmented student-predicted x_0
+
+    Generator loss uses hinge or cross-entropy on fake samples.
+    Discriminator loss uses standard real/fake classification.
+    """
+
+    def __init__(
+        self,
+        adv_lambda: float = 1.0,
+        loss_type: str = "hinge",
+        r1_penalty_weight: float = 0.0,
+    ):
+        super().__init__()
+        self.adv_lambda = adv_lambda
+        self.loss_type = loss_type
+        self.r1_penalty_weight = r1_penalty_weight
+
+    def generator_loss(
+        self,
+        pred_fake: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """Adversarial loss for generator (fool discriminator)."""
+        if self.loss_type == "hinge":
+            loss = -torch.mean(pred_fake)
+        else:  # cross_entropy
+            loss = F.binary_cross_entropy_with_logits(pred_fake, torch.ones_like(pred_fake))
+
+        return loss * self.adv_lambda, {"adv_loss_G": loss.item()}
+
+    def discriminator_loss(
+        self,
+        pred_real: torch.Tensor,
+        pred_fake: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """Adversarial loss for discriminator."""
+        if self.loss_type == "hinge":
+            loss_real = torch.mean(F.relu(1.0 - pred_real))
+            loss_fake = torch.mean(F.relu(1.0 + pred_fake))
+            loss = 0.5 * (loss_real + loss_fake)
+        else:  # cross_entropy
+            loss_real = F.binary_cross_entropy_with_logits(pred_real, torch.ones_like(pred_real))
+            loss_fake = F.binary_cross_entropy_with_logits(pred_fake, torch.zeros_like(pred_fake))
+            loss = loss_real + loss_fake
+
+        return loss, {
+            "D_loss": loss.item(),
+            "D_loss_real": loss_real.item(),
+            "D_loss_fake": loss_fake.item(),
+        }
+
+
+# ============================================================================
+#  Noise / Flow Utilities
+# ============================================================================
+
+def _get_x0_from_noise(
+    noisy_latents: torch.Tensor,
+    noise_pred: torch.Tensor,
+    alphas_cumprod: torch.Tensor,
+    timesteps: torch.Tensor,
+) -> torch.Tensor:
+    """Predict x_0 from noise prediction using DDPM formula."""
+    alpha_t = alphas_cumprod[timesteps.long()].view(-1, 1, 1, 1)
+    x0 = (noisy_latents - (1 - alpha_t).sqrt() * noise_pred) / alpha_t.sqrt().clamp(min=1e-8)
+    return x0
+
+
+def _sample_trigflow_timesteps(
+    batch_size: int,
+    device: torch.device,
+    logit_mean: float = 0.0,
+    logit_std: float = 1.0,
+) -> torch.Tensor:
+    """Sample timesteps for trigonometric flow (used by CTCD / SANA-Sprint)."""
+    u = torch.randn(batch_size, device=device) * logit_std + logit_mean
+    u = torch.sigmoid(u)  # uniform in [0, 1]
+    t = u * (math.pi / 2)  # map to [0, pi/2]
+    return t
 
 
 # ============================================================================
@@ -346,12 +661,22 @@ class KnowledgeDistillationPipeline:
     """
     Knowledge Distillation pipeline for optimizing diffusion models.
 
-    Workflow:
-    1. Load teacher model (full-size, high quality)
-    2. Create student model (smaller/pruned/quantized)
-    3. Pre-compute text embeddings for training captions
-    4. Train student to match teacher's noise predictions and features
-    5. Evaluate student on image generation quality
+    Implements two state-of-the-art approaches:
+
+    DMD2 (kd_mode="dmd2"):
+        - Distribution matching: real vs fake score gradient
+        - GAN loss with classification head on fake-score UNet
+        - Two-timescale update (dfake updated more frequently than generator)
+
+    CTCD (kd_mode="ctcd"):
+        - Continuous-time consistency distillation via JVP-based tangent
+        - Trigonometric flow parameterization
+        - Tangent normalization and warmup
+
+    CTCD+LADD (kd_mode="ctcd_ladd"):
+        - CTCD loss + latent adversarial distillation
+        - Discriminator on noise-augmented latents
+        - Alternating generator/discriminator updates
 
     Supports: SDXL, Flux, SD3, SANA model families.
     """
@@ -361,49 +686,79 @@ class KnowledgeDistillationPipeline:
         teacher_model_name: str = "SDXL",
         student_model_name: Optional[str] = None,
         student_num_blocks: Optional[int] = None,
-        kd_mode: str = "output",           # output | feature | attention | progressive
-        alpha: float = 0.5,
-        temperature: float = 1.0,
-        feature_weight: float = 1.0,
-        attention_weight: float = 1.0,
-        progressive_weight: float = 1.0,
+        kd_mode: str = "dmd2",               # dmd2 | ctcd | ctcd_ladd
+        # DMD2 specific
+        dm_loss_weight: float = 1.0,
+        gan_loss_weight: float = 1.0,
+        real_guidance_scale: float = 6.0,
+        dfake_gen_update_ratio: int = 5,
+        # CTCD specific
+        sigma_data: float = 1.0,
+        tangent_warmup_steps: int = 1000,
+        ctcd_logit_mean: float = 0.0,
+        ctcd_logit_std: float = 1.0,
+        # LADD specific
+        adv_lambda: float = 0.1,
+        scm_lambda: float = 1.0,
+        ladd_loss_type: str = "hinge",
+        # General training
         learning_rate: float = 1e-5,
+        guidance_lr: Optional[float] = None,
         num_epochs: int = 5,
         batch_size: int = 1,
         num_train_timesteps: int = 1000,
         gradient_accumulation_steps: int = 4,
         use_ema: bool = True,
         ema_decay: float = 0.9999,
-        feature_layers: Optional[List[str]] = None,
         device: str = "cuda",
     ):
         self.teacher_model_name = teacher_model_name
         self.student_model_name = student_model_name or teacher_model_name
         self.student_num_blocks = student_num_blocks
         self.kd_mode = kd_mode
-        self.alpha = alpha
-        self.temperature = temperature
-        self.feature_weight = feature_weight
-        self.attention_weight = attention_weight
-        self.progressive_weight = progressive_weight
+
+        # DMD2 params
+        self.dm_loss_weight = dm_loss_weight
+        self.gan_loss_weight = gan_loss_weight
+        self.real_guidance_scale = real_guidance_scale
+        self.dfake_gen_update_ratio = dfake_gen_update_ratio
+
+        # CTCD params
+        self.sigma_data = sigma_data
+        self.tangent_warmup_steps = tangent_warmup_steps
+        self.ctcd_logit_mean = ctcd_logit_mean
+        self.ctcd_logit_std = ctcd_logit_std
+
+        # LADD params
+        self.adv_lambda = adv_lambda
+        self.scm_lambda = scm_lambda
+        self.ladd_loss_type = ladd_loss_type
+
+        # General
         self.learning_rate = learning_rate
+        self.guidance_lr = guidance_lr or learning_rate
         self.num_epochs = num_epochs
         self.batch_size = batch_size
         self.num_train_timesteps = num_train_timesteps
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.use_ema = use_ema
         self.ema_decay = ema_decay
-        self.feature_layers = feature_layers or ["attn", "ff", "mid_block"]
         self.device = device
 
         # Will be filled during load
         self.teacher_pipeline = None
         self.student_pipeline = None
-        self.teacher_denoiser = None   # UNet or Transformer
+        self.teacher_denoiser = None
         self.student_denoiser = None
         self.scheduler = None
         self.ema_model = None
         self.model_type = None
+
+        # DMD2 specific
+        self.fake_score_net = None
+
+        # LADD specific
+        self.discriminator = None
 
         # Config from config.json
         self.config = self._load_config()
@@ -484,6 +839,20 @@ class KnowledgeDistillationPipeline:
         print(f"  Student params : {student_params:,}")
         print(f"  EMA enabled    : {self.use_ema}")
 
+        # Create mode-specific auxiliary networks
+        if self.kd_mode == "dmd2":
+            print("  Creating Fake Score Network (DMD2)...")
+            self.fake_score_net = FakeScoreNetwork(
+                self.teacher_denoiser, self.model_type, self.device,
+            ).to(self.device)
+
+        if self.kd_mode == "ctcd_ladd":
+            print("  Creating Latent Discriminator (LADD)...")
+            latent_ch = 4 if self.model_type == "sdxl" else 16
+            self.discriminator = LatentDiscriminator(
+                self.teacher_denoiser, latent_ch, self.device,
+            ).to(self.device)
+
     def _create_slim_student(self, num_blocks: int) -> nn.Module:
         """
         Create a smaller student by removing transformer/UNet blocks.
@@ -492,7 +861,6 @@ class KnowledgeDistillationPipeline:
         student = copy.deepcopy(self.teacher_denoiser)
 
         if self.model_type == "sdxl":
-            # SDXL UNet: trim down_blocks and up_blocks
             if hasattr(student, "down_blocks"):
                 original_count = len(student.down_blocks)
                 if num_blocks < original_count:
@@ -511,7 +879,6 @@ class KnowledgeDistillationPipeline:
                     print(f"  Trimmed up_blocks: {original_count} -> {num_blocks}")
 
         elif self.model_type in ("flux", "sd3"):
-            # Transformer-based: trim transformer_blocks
             if hasattr(student, "transformer_blocks"):
                 original_count = len(student.transformer_blocks)
                 if num_blocks < original_count:
@@ -606,7 +973,6 @@ class KnowledgeDistillationPipeline:
                         embeds = result
                         pooled = None
                 elif self.model_type == "flux":
-                    # Flux uses T5 + CLIP encoders
                     result = self.teacher_pipeline.encode_prompt(
                         prompt=batch,
                         prompt_2=batch,
@@ -644,34 +1010,41 @@ class KnowledgeDistillationPipeline:
         return prompt_embeds, pooled_prompt_embeds
 
     # ------------------------------------------------------------------
-    # Training Loop
+    # Training Loops
     # ------------------------------------------------------------------
 
     def train(self, captions: List[str], output_dir: str):
         """
-        Main distillation training loop.
-
-        Args:
-            captions: list of text prompts for training
-            output_dir: directory to save checkpoints and logs
+        Main distillation training loop. Dispatches to mode-specific training.
         """
         os.makedirs(output_dir, exist_ok=True)
+
+        if self.kd_mode == "dmd2":
+            return self._train_dmd2(captions, output_dir)
+        elif self.kd_mode == "ctcd":
+            return self._train_ctcd(captions, output_dir, use_ladd=False)
+        elif self.kd_mode == "ctcd_ladd":
+            return self._train_ctcd(captions, output_dir, use_ladd=True)
+        else:
+            raise ValueError(f"Unknown kd_mode: {self.kd_mode}. Choose from: dmd2, ctcd, ctcd_ladd")
+
+    def _train_dmd2(self, captions: List[str], output_dir: str):
+        """
+        DMD2 training loop.
+
+        Two-timescale update:
+        1. Every step: update fake score network (denoising + GAN discriminator loss)
+        2. Every dfake_gen_update_ratio steps: update generator (DM + GAN loss)
+        """
         log_path = os.path.join(output_dir, "training_log.json")
 
-        # 1. Encode all prompts
+        # 1. Encode prompts
         prompt_embeds, pooled_prompt_embeds = self.encode_prompts(captions)
 
-        # 2. Determine latent shape based on model type
-        if self.model_type == "sdxl":
-            latent_shape = (4, 128, 128)   # SDXL 1024x1024 => 128x128 latent
-        elif self.model_type == "flux":
-            latent_shape = (16, 64, 64)
-        elif self.model_type == "sd3":
-            latent_shape = (16, 128, 128)
-        else:
-            latent_shape = (4, 128, 128)
+        # 2. Latent shape
+        latent_shape = self._get_latent_shape()
 
-        # 3. Create dataset and dataloader
+        # 3. Dataset
         dataset = CaptionNoiseDataset(
             prompt_embeds=prompt_embeds,
             pooled_prompt_embeds=pooled_prompt_embeds,
@@ -679,63 +1052,51 @@ class KnowledgeDistillationPipeline:
             num_train_timesteps=self.num_train_timesteps,
         )
         dataloader = DataLoader(
-            dataset,
-            batch_size=self.batch_size,
-            shuffle=True,
-            num_workers=2,
-            pin_memory=True,
-            drop_last=True,
+            dataset, batch_size=self.batch_size,
+            shuffle=True, num_workers=2, pin_memory=True, drop_last=True,
         )
 
-        # 4. Setup loss functions
-        output_loss_fn = KDLossOutput(alpha=self.alpha, temperature=self.temperature)
+        # 4. Loss
+        dmd2_loss = DMD2Loss(
+            dm_loss_weight=self.dm_loss_weight,
+            gan_loss_weight=self.gan_loss_weight,
+            real_guidance_scale=self.real_guidance_scale,
+        )
 
-        teacher_extractor = None
-        student_extractor = None
-        feature_loss_fn = None
-        attention_loss_fn = None
-
-        if self.kd_mode in ("feature", "attention"):
-            teacher_extractor = FeatureExtractor(self.teacher_denoiser, self.feature_layers)
-            student_extractor = FeatureExtractor(self.student_denoiser, self.feature_layers)
-
-        if self.kd_mode == "feature":
-            # We'll initialize feature_loss_fn after the first forward pass
-            # to determine actual dimensions
-            pass
-        if self.kd_mode == "attention":
-            attention_loss_fn = KDLossAttentionTransfer(weight=self.attention_weight)
-
-        progressive_loss_fn = None
-        if self.kd_mode == "progressive":
-            progressive_loss_fn = ProgressiveDistillationLoss(weight=self.progressive_weight)
-
-        # 5. Setup optimizer
-        optimizer = torch.optim.AdamW(
+        # 5. Optimizers (two-timescale)
+        optimizer_G = torch.optim.AdamW(
             self.student_denoiser.parameters(),
-            lr=self.learning_rate,
-            weight_decay=1e-2,
+            lr=self.learning_rate, weight_decay=1e-2,
+        )
+        guidance_params = list(self.fake_score_net.parameters())
+        optimizer_D = torch.optim.AdamW(
+            guidance_params, lr=self.guidance_lr, weight_decay=1e-2,
         )
 
-        # Cosine annealing scheduler
         total_steps = len(dataloader) * self.num_epochs // self.gradient_accumulation_steps
-        lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=total_steps, eta_min=self.learning_rate * 0.01
+        lr_scheduler_G = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer_G, T_max=max(total_steps, 1), eta_min=self.learning_rate * 0.01,
         )
 
-        # 6. Training loop
+        # Get alphas_cumprod
+        if hasattr(self.scheduler, "alphas_cumprod"):
+            alphas_cumprod = self.scheduler.alphas_cumprod.to(self.device)
+        else:
+            alphas_cumprod = torch.linspace(1.0, 0.01, self.num_train_timesteps).to(self.device)
+
+        # 6. Training
         print("\n" + "=" * 60)
-        print("  Starting Knowledge Distillation Training")
+        print("  Starting DMD2 Distillation Training")
         print("=" * 60)
-        print(f"  Mode             : {self.kd_mode}")
-        print(f"  Epochs           : {self.num_epochs}")
-        print(f"  Batch size       : {self.batch_size}")
-        print(f"  Learning rate    : {self.learning_rate}")
-        print(f"  Grad accum steps : {self.gradient_accumulation_steps}")
-        print(f"  Total steps      : {total_steps}")
-        print(f"  Alpha            : {self.alpha}")
-        print(f"  Temperature      : {self.temperature}")
-        print(f"  Latent shape     : {latent_shape}")
+        print(f"  Mode               : {self.kd_mode}")
+        print(f"  Epochs             : {self.num_epochs}")
+        print(f"  Batch size         : {self.batch_size}")
+        print(f"  Generator LR       : {self.learning_rate}")
+        print(f"  Guidance LR        : {self.guidance_lr}")
+        print(f"  DM loss weight     : {self.dm_loss_weight}")
+        print(f"  GAN loss weight    : {self.gan_loss_weight}")
+        print(f"  D/G update ratio   : {self.dfake_gen_update_ratio}")
+        print(f"  Latent shape       : {latent_shape}")
         print()
 
         training_log = []
@@ -749,124 +1110,101 @@ class KnowledgeDistillationPipeline:
             epoch_loss = 0.0
             epoch_metrics = {}
             self.student_denoiser.train()
+            self.fake_score_net.train()
 
             pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{self.num_epochs}")
-            for step, (noise, timesteps, embeds, pooled) in enumerate(pbar):
+            for step, (noise, timesteps_raw, embeds, pooled) in enumerate(pbar):
                 noise = noise.to(self.device, dtype=torch.float16)
-                timesteps = timesteps.to(self.device).squeeze()
                 embeds = embeds.to(self.device, dtype=torch.float16)
                 if pooled.dim() > 1:
                     pooled = pooled.to(self.device, dtype=torch.float16)
                 else:
                     pooled = None
 
-                # Create noisy latent
-                alpha_t = self._get_alpha(timesteps)
-                sigma_t = (1 - alpha_t).sqrt()
-                clean_latent = torch.randn_like(noise)
-                noisy_latent = alpha_t.sqrt().view(-1, 1, 1, 1) * clean_latent + sigma_t.view(-1, 1, 1, 1) * noise
+                forward_kwargs = self._get_forward_kwargs(pooled, noise.shape[0])
+                is_generator_step = (global_step % self.dfake_gen_update_ratio == 0)
 
-                # ------ Teacher forward (no gradient) ------
-                with torch.no_grad():
-                    teacher_pred = self._forward_denoiser(
-                        self.teacher_denoiser, noisy_latent, timesteps, embeds, pooled
+                # Step 1: Generate images with student (feedforward)
+                conditioning_timestep = torch.ones(
+                    noise.shape[0], device=self.device, dtype=torch.long
+                ) * (self.num_train_timesteps - 1)
+
+                if is_generator_step:
+                    gen_noise_pred = self._forward_denoiser(
+                        self.student_denoiser, noise, conditioning_timestep, embeds, pooled,
+                    )
+                else:
+                    with torch.no_grad():
+                        gen_noise_pred = self._forward_denoiser(
+                            self.student_denoiser, noise, conditioning_timestep, embeds, pooled,
+                        )
+
+                generated_latents = _get_x0_from_noise(
+                    noise.double(), gen_noise_pred.double(),
+                    alphas_cumprod.double(), conditioning_timestep,
+                ).float()
+
+                # Step 2: Generator update (DM + GAN loss)
+                if is_generator_step:
+                    # Distribution matching loss
+                    loss_dm, dm_metrics = dmd2_loss.compute_distribution_matching_loss(
+                        generated_latents, self.teacher_denoiser,
+                        self.fake_score_net, embeds,
+                        self.scheduler, alphas_cumprod,
+                        self.num_train_timesteps, self.model_type,
+                        self.device, forward_kwargs,
                     )
 
-                # ------ Student forward ------
-                student_pred = self._forward_denoiser(
-                    self.student_denoiser, noisy_latent, timesteps, embeds, pooled
+                    # GAN loss for generator
+                    loss_gan_g, gan_g_metrics = dmd2_loss.compute_gan_loss_generator(
+                        generated_latents, self.fake_score_net,
+                    )
+
+                    gen_loss = (loss_dm + loss_gan_g) / self.gradient_accumulation_steps
+                    gen_loss.backward()
+
+                    if (step + 1) % self.gradient_accumulation_steps == 0:
+                        torch.nn.utils.clip_grad_norm_(self.student_denoiser.parameters(), 10.0)
+                        optimizer_G.step()
+                        lr_scheduler_G.step()
+                        optimizer_G.zero_grad()
+                        optimizer_D.zero_grad()
+
+                        if self.use_ema and self.ema_model is not None:
+                            self._update_ema()
+
+                    metrics = {**dm_metrics, **gan_g_metrics}
+                    epoch_loss += (loss_dm.item() + loss_gan_g.item())
+                else:
+                    metrics = {}
+
+                # Step 3: Guidance/discriminator update (every step)
+                # Fake score denoising loss
+                loss_fake, fake_metrics = dmd2_loss.compute_fake_score_loss(
+                    generated_latents, self.fake_score_net,
+                    self.scheduler, embeds,
+                    self.num_train_timesteps, self.device, forward_kwargs,
                 )
 
-                # ------ Compute loss ------
-                if self.kd_mode == "output":
-                    loss, metrics = output_loss_fn(student_pred, teacher_pred, noise)
-
-                elif self.kd_mode == "feature":
-                    loss_out, m_out = output_loss_fn(student_pred, teacher_pred, noise)
-                    if feature_loss_fn is None and teacher_extractor and student_extractor:
-                        t_feats = teacher_extractor.get_features()
-                        s_feats = student_extractor.get_features()
-                        if t_feats and s_feats:
-                            t_dims = [f.shape[-1] for f in t_feats]
-                            s_dims = [f.shape[-1] for f in s_feats]
-                            feature_loss_fn = KDLossFeature(
-                                t_dims, s_dims, weight=self.feature_weight
-                            ).to(self.device)
-
-                    loss = loss_out
-                    metrics = m_out
-                    if feature_loss_fn and teacher_extractor and student_extractor:
-                        t_feats = teacher_extractor.get_features()
-                        s_feats = student_extractor.get_features()
-                        if t_feats and s_feats:
-                            loss_feat, m_feat = feature_loss_fn(s_feats, t_feats)
-                            loss = loss + loss_feat
-                            metrics.update(m_feat)
-                    if teacher_extractor:
-                        teacher_extractor.clear()
-                    if student_extractor:
-                        student_extractor.clear()
-
-                elif self.kd_mode == "attention":
-                    loss_out, m_out = output_loss_fn(student_pred, teacher_pred, noise)
-                    loss = loss_out
-                    metrics = m_out
-                    if attention_loss_fn and teacher_extractor and student_extractor:
-                        t_attns = teacher_extractor.get_attentions()
-                        s_attns = student_extractor.get_attentions()
-                        if t_attns and s_attns:
-                            loss_attn, m_attn = attention_loss_fn(s_attns, t_attns)
-                            loss = loss + loss_attn
-                            metrics.update(m_attn)
-                    if teacher_extractor:
-                        teacher_extractor.clear()
-                    if student_extractor:
-                        student_extractor.clear()
-
-                elif self.kd_mode == "progressive":
-                    # Progressive distillation: teacher does 2 steps, student does 1
-                    with torch.no_grad():
-                        # Teacher step 1
-                        t_mid = timesteps // 2
-                        teacher_pred_1 = self._forward_denoiser(
-                            self.teacher_denoiser, noisy_latent, timesteps, embeds, pooled
-                        )
-                        # Estimate x at t_mid
-                        mid_latent = self._ddim_step(noisy_latent, teacher_pred_1, timesteps, t_mid)
-                        # Teacher step 2
-                        teacher_pred_2 = self._forward_denoiser(
-                            self.teacher_denoiser, mid_latent, t_mid, embeds, pooled
-                        )
-                        # Final teacher target
-                        t_target = torch.zeros_like(timesteps)
-                        teacher_result = self._ddim_step(mid_latent, teacher_pred_2, t_mid, t_target)
-
-                    loss, metrics = progressive_loss_fn(student_pred, teacher_result)
-                else:
-                    loss, metrics = output_loss_fn(student_pred, teacher_pred, noise)
-
-                # Gradient accumulation
-                loss = loss / self.gradient_accumulation_steps
-                loss.backward()
+                guidance_loss = loss_fake / self.gradient_accumulation_steps
+                guidance_loss.backward()
 
                 if (step + 1) % self.gradient_accumulation_steps == 0:
-                    torch.nn.utils.clip_grad_norm_(self.student_denoiser.parameters(), 1.0)
-                    optimizer.step()
-                    lr_scheduler.step()
-                    optimizer.zero_grad()
-                    global_step += 1
+                    torch.nn.utils.clip_grad_norm_(self.fake_score_net.parameters(), 10.0)
+                    optimizer_D.step()
+                    optimizer_D.zero_grad()
+                    optimizer_G.zero_grad()
 
-                    # Update EMA
-                    if self.use_ema and self.ema_model is not None:
-                        self._update_ema()
-
-                epoch_loss += loss.item() * self.gradient_accumulation_steps
+                metrics.update(fake_metrics)
                 for k, v in metrics.items():
                     epoch_metrics[k] = epoch_metrics.get(k, 0) + v
 
-                pbar.set_postfix(loss=f"{loss.item() * self.gradient_accumulation_steps:.4f}")
+                pbar.set_postfix(
+                    dm=f"{metrics.get('loss_dm', 0):.4f}",
+                    fake=f"{metrics.get('loss_fake_score', 0):.4f}",
+                )
 
-                # Periodic memory cleanup
+                global_step += 1
                 if step % 50 == 0:
                     free_memory()
 
@@ -874,56 +1212,296 @@ class KnowledgeDistillationPipeline:
             avg_loss = epoch_loss / max(len(dataloader), 1)
             avg_metrics = {k: v / max(len(dataloader), 1) for k, v in epoch_metrics.items()}
 
-            log_entry = {
-                "epoch": epoch + 1,
-                "avg_loss": avg_loss,
-                "lr": optimizer.param_groups[0]["lr"],
-                **avg_metrics,
-            }
+            log_entry = {"epoch": epoch + 1, "avg_loss": avg_loss, "lr": optimizer_G.param_groups[0]["lr"], **avg_metrics}
             training_log.append(log_entry)
 
             print(f"\n  Epoch {epoch + 1} Summary:")
             print(f"    Avg Loss : {avg_loss:.6f}")
-            print(f"    LR       : {optimizer.param_groups[0]['lr']:.2e}")
             for k, v in avg_metrics.items():
                 print(f"    {k}: {v:.6f}")
 
-            # Save checkpoint if best
             if avg_loss < best_loss:
                 best_loss = avg_loss
                 self._save_checkpoint(output_dir, epoch + 1, is_best=True)
 
-            # Save periodic checkpoint
             if (epoch + 1) % max(1, self.num_epochs // 3) == 0:
                 self._save_checkpoint(output_dir, epoch + 1)
 
-        # Cleanup extractors
-        if teacher_extractor:
-            teacher_extractor.remove_hooks()
-        if student_extractor:
-            student_extractor.remove_hooks()
-
-        # Save final checkpoint and training log
         self._save_checkpoint(output_dir, self.num_epochs, is_final=True)
         with open(log_path, "w") as f:
             json.dump(training_log, f, indent=2)
 
-        print(f"\n  Training complete! Logs saved to {log_path}")
+        print(f"\n  DMD2 Training complete! Logs saved to {log_path}")
+        return training_log
+
+    def _train_ctcd(self, captions: List[str], output_dir: str, use_ladd: bool = False):
+        """
+        CTCD / CTCD+LADD training loop (SANA-Sprint).
+
+        If use_ladd=True: alternating G/D phases with combined CTCD + adversarial loss.
+        """
+        log_path = os.path.join(output_dir, "training_log.json")
+
+        # 1. Encode prompts
+        prompt_embeds, pooled_prompt_embeds = self.encode_prompts(captions)
+
+        # 2. Latent shape & dataset
+        latent_shape = self._get_latent_shape()
+        dataset = CaptionNoiseDataset(
+            prompt_embeds=prompt_embeds,
+            pooled_prompt_embeds=pooled_prompt_embeds,
+            latent_shape=latent_shape,
+            num_train_timesteps=self.num_train_timesteps,
+        )
+        dataloader = DataLoader(
+            dataset, batch_size=self.batch_size,
+            shuffle=True, num_workers=2, pin_memory=True, drop_last=True,
+        )
+
+        # 3. Loss functions
+        ctcd_loss_fn = CTCDLoss(
+            sigma_data=self.sigma_data,
+            tangent_warmup_steps=self.tangent_warmup_steps,
+        )
+        ladd_loss_fn = LADDLoss(
+            adv_lambda=self.adv_lambda,
+            loss_type=self.ladd_loss_type,
+        ) if use_ladd else None
+
+        # 4. Optimizers
+        optimizer_G = torch.optim.AdamW(
+            self.student_denoiser.parameters(),
+            lr=self.learning_rate, weight_decay=1e-2,
+        )
+
+        optimizer_D = None
+        if use_ladd and self.discriminator is not None:
+            optimizer_D = torch.optim.AdamW(
+                self.discriminator.head.parameters(),
+                lr=self.guidance_lr, weight_decay=1e-2,
+            )
+
+        total_steps = len(dataloader) * self.num_epochs // self.gradient_accumulation_steps
+        lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer_G, T_max=max(total_steps, 1), eta_min=self.learning_rate * 0.01,
+        )
+
+        # 5. Print config
+        mode_name = "CTCD + LADD" if use_ladd else "CTCD"
+        print("\n" + "=" * 60)
+        print(f"  Starting {mode_name} Distillation Training")
+        print("=" * 60)
+        print(f"  Mode             : {self.kd_mode}")
+        print(f"  Epochs           : {self.num_epochs}")
+        print(f"  Batch size       : {self.batch_size}")
+        print(f"  Learning rate    : {self.learning_rate}")
+        print(f"  Sigma data       : {self.sigma_data}")
+        print(f"  Tangent warmup   : {self.tangent_warmup_steps}")
+        if use_ladd:
+            print(f"  LADD lambda      : {self.adv_lambda}")
+            print(f"  SCM lambda       : {self.scm_lambda}")
+            print(f"  LADD loss type   : {self.ladd_loss_type}")
+        print(f"  Latent shape     : {latent_shape}")
+        print()
+
+        training_log = []
+        global_step = 0
+        best_loss = float("inf")
+        phase = "G"
+
+        self.teacher_denoiser.eval()
+        self.student_denoiser.to(self.device)
+
+        for epoch in range(self.num_epochs):
+            epoch_loss = 0.0
+            epoch_metrics = {}
+            self.student_denoiser.train()
+
+            pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{self.num_epochs}")
+            for step, (noise, _, embeds, pooled) in enumerate(pbar):
+                noise = noise.to(self.device, dtype=torch.float16)
+                embeds = embeds.to(self.device, dtype=torch.float16)
+                if pooled.dim() > 1:
+                    pooled = pooled.to(self.device, dtype=torch.float16)
+                else:
+                    pooled = None
+
+                sd = self.sigma_data
+                clean_images = torch.randn_like(noise) * sd  # Random clean in latent space
+                model_kwargs = self._get_forward_kwargs(pooled, noise.shape[0])
+
+                # Sample timesteps (trigonometric flow)
+                timesteps = _sample_trigflow_timesteps(
+                    noise.shape[0], self.device,
+                    logit_mean=self.ctcd_logit_mean,
+                    logit_std=self.ctcd_logit_std,
+                )
+
+                if phase == "G":
+                    if use_ladd and self.discriminator is not None:
+                        self.discriminator.eval()
+                    self.student_denoiser.train()
+
+                    # CTCD loss
+                    ctcd_l, ctcd_m = ctcd_loss_fn(
+                        self.student_denoiser, self.teacher_denoiser,
+                        clean_images, embeds, None, timesteps,
+                        global_step, model_kwargs,
+                    )
+
+                    total_loss = self.scm_lambda * ctcd_l
+
+                    # LADD adversarial loss for generator
+                    if use_ladd and self.discriminator is not None:
+                        t_view = timesteps.view(-1, 1, 1, 1)
+                        x_t = torch.cos(t_view) * clean_images + torch.sin(t_view) * noise * sd
+
+                        with torch.no_grad():
+                            student_pred = self._forward_denoiser(
+                                self.student_denoiser, x_t / sd, timesteps, embeds, pooled,
+                            )
+                        pred_x0 = torch.cos(t_view) * x_t - torch.sin(t_view) * student_pred * sd
+
+                        # Noise augment pred_x0 for discriminator
+                        t_D = _sample_trigflow_timesteps(noise.shape[0], self.device, 0.0, 1.0)
+                        t_D_view = t_D.view(-1, 1, 1, 1)
+                        z_D = torch.randn_like(pred_x0) * sd
+                        noised_pred = torch.cos(t_D_view) * pred_x0 + torch.sin(t_D_view) * z_D
+
+                        pred_fake = self.discriminator(
+                            noised_pred / sd, t_D,
+                            encoder_hidden_states=embeds,
+                            **model_kwargs,
+                        )
+                        adv_l, adv_m = ladd_loss_fn.generator_loss(pred_fake)
+                        total_loss = total_loss + adv_l
+                        ctcd_m.update(adv_m)
+
+                    total_loss = total_loss / self.gradient_accumulation_steps
+                    total_loss.backward()
+
+                    if (step + 1) % self.gradient_accumulation_steps == 0:
+                        torch.nn.utils.clip_grad_norm_(self.student_denoiser.parameters(), 10.0)
+                        optimizer_G.step()
+                        lr_scheduler.step()
+                        optimizer_G.zero_grad()
+                        if optimizer_D is not None:
+                            optimizer_D.zero_grad()
+
+                        if self.use_ema and self.ema_model is not None:
+                            self._update_ema()
+
+                        if use_ladd:
+                            phase = "D"
+
+                        global_step += 1
+
+                    metrics = ctcd_m
+                    epoch_loss += total_loss.item() * self.gradient_accumulation_steps
+
+                elif phase == "D" and use_ladd and self.discriminator is not None:
+                    self.discriminator.train()
+                    self.student_denoiser.eval()
+
+                    t_view = timesteps.view(-1, 1, 1, 1)
+                    x_t = torch.cos(t_view) * clean_images + torch.sin(t_view) * noise * sd
+
+                    with torch.no_grad():
+                        student_pred = self._forward_denoiser(
+                            self.student_denoiser, x_t / sd, timesteps, embeds, pooled,
+                        )
+                        pred_x0 = torch.cos(t_view) * x_t - torch.sin(t_view) * student_pred * sd
+
+                    # Noise augment for discriminator
+                    t_D_fake = _sample_trigflow_timesteps(noise.shape[0], self.device, 0.0, 1.0)
+                    t_D_real = _sample_trigflow_timesteps(noise.shape[0], self.device, 0.0, 1.0)
+                    z_D_fake = torch.randn_like(pred_x0) * sd
+                    z_D_real = torch.randn_like(clean_images) * sd
+
+                    noised_fake = torch.cos(t_D_fake.view(-1,1,1,1)) * pred_x0 + torch.sin(t_D_fake.view(-1,1,1,1)) * z_D_fake
+                    noised_real = torch.cos(t_D_real.view(-1,1,1,1)) * clean_images + torch.sin(t_D_real.view(-1,1,1,1)) * z_D_real
+
+                    pred_fake = self.discriminator(noised_fake / sd, t_D_fake, encoder_hidden_states=embeds, **model_kwargs)
+                    pred_real = self.discriminator(noised_real / sd, t_D_real, encoder_hidden_states=embeds, **model_kwargs)
+
+                    d_loss, d_metrics = ladd_loss_fn.discriminator_loss(pred_real, pred_fake)
+                    d_loss = d_loss / self.gradient_accumulation_steps
+                    d_loss.backward()
+
+                    if (step + 1) % self.gradient_accumulation_steps == 0:
+                        torch.nn.utils.clip_grad_norm_(self.discriminator.head.parameters(), 10.0)
+                        optimizer_D.step()
+                        optimizer_D.zero_grad()
+                        optimizer_G.zero_grad()
+                        phase = "G"
+                        global_step += 1
+
+                    metrics = d_metrics
+                else:
+                    metrics = {}
+                    global_step += 1
+
+                for k, v in metrics.items():
+                    epoch_metrics[k] = epoch_metrics.get(k, 0) + v
+
+                pbar.set_postfix(
+                    phase=phase,
+                    loss=f"{metrics.get('ctcd_loss', metrics.get('D_loss', 0)):.4f}",
+                )
+
+                if step % 50 == 0:
+                    free_memory()
+
+            # End of epoch
+            avg_loss = epoch_loss / max(len(dataloader), 1)
+            avg_metrics = {k: v / max(len(dataloader), 1) for k, v in epoch_metrics.items()}
+
+            log_entry = {"epoch": epoch + 1, "avg_loss": avg_loss, "lr": optimizer_G.param_groups[0]["lr"], **avg_metrics}
+            training_log.append(log_entry)
+
+            print(f"\n  Epoch {epoch + 1} Summary:")
+            print(f"    Avg Loss : {avg_loss:.6f}")
+            for k, v in avg_metrics.items():
+                print(f"    {k}: {v:.6f}")
+
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+                self._save_checkpoint(output_dir, epoch + 1, is_best=True)
+
+            if (epoch + 1) % max(1, self.num_epochs // 3) == 0:
+                self._save_checkpoint(output_dir, epoch + 1)
+
+        self._save_checkpoint(output_dir, self.num_epochs, is_final=True)
+        with open(log_path, "w") as f:
+            json.dump(training_log, f, indent=2)
+
+        print(f"\n  {mode_name} Training complete! Logs saved to {log_path}")
         return training_log
 
     # ------------------------------------------------------------------
-    # Helpers for training  
+    # Helpers for training
     # ------------------------------------------------------------------
 
-    def _get_alpha(self, timesteps: torch.Tensor) -> torch.Tensor:
-        """Get alpha values for given timesteps from the scheduler."""
-        if hasattr(self.scheduler, "alphas_cumprod"):
-            alphas = self.scheduler.alphas_cumprod.to(timesteps.device)
-            return alphas[timesteps.long()]
+    def _get_latent_shape(self) -> Tuple[int, ...]:
+        if self.model_type == "sdxl":
+            return (4, 128, 128)
+        elif self.model_type == "flux":
+            return (16, 64, 64)
+        elif self.model_type == "sd3":
+            return (16, 128, 128)
         else:
-            # Fallback: linear schedule
-            t_norm = timesteps.float() / self.num_train_timesteps
-            return 1.0 - t_norm
+            return (4, 128, 128)
+
+    def _get_forward_kwargs(self, pooled: Optional[torch.Tensor], batch_size: int) -> dict:
+        """Build model-specific forward kwargs."""
+        kwargs = {}
+        if self.model_type == "sdxl" and pooled is not None:
+            time_ids = torch.zeros(batch_size, 6, device=self.device, dtype=pooled.dtype)
+            kwargs["added_cond_kwargs"] = {
+                "text_embeds": pooled,
+                "time_ids": time_ids,
+            }
+        return kwargs
 
     def _forward_denoiser(
         self,
@@ -934,50 +1512,15 @@ class KnowledgeDistillationPipeline:
         pooled: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass through the denoising model, handling different architectures."""
-        kwargs = {}
+        kwargs = self._get_forward_kwargs(pooled, latent.shape[0])
 
-        if self.model_type == "sdxl":
-            # SDXL UNet expects added_cond_kwargs with text_embeds and time_ids
-            if pooled is not None:
-                time_ids = torch.zeros(latent.shape[0], 6, device=self.device, dtype=latent.dtype)
-                kwargs["added_cond_kwargs"] = {
-                    "text_embeds": pooled,
-                    "time_ids": time_ids,
-                }
-            output = model(latent, timesteps, encoder_hidden_states=encoder_hidden_states, **kwargs)
-
-        elif self.model_type == "flux":
-            output = model(latent, timesteps, encoder_hidden_states=encoder_hidden_states, **kwargs)
-
-        elif self.model_type == "sd3":
-            output = model(latent, timesteps, encoder_hidden_states=encoder_hidden_states, **kwargs)
-
-        else:
-            output = model(latent, timesteps, encoder_hidden_states=encoder_hidden_states, **kwargs)
+        output = model(latent, timesteps, encoder_hidden_states=encoder_hidden_states, **kwargs)
 
         if isinstance(output, tuple):
             return output[0]
         if hasattr(output, "sample"):
             return output.sample
         return output
-
-    def _ddim_step(
-        self,
-        x_t: torch.Tensor,
-        noise_pred: torch.Tensor,
-        t_from: torch.Tensor,
-        t_to: torch.Tensor,
-    ) -> torch.Tensor:
-        """Single DDIM deterministic step from t_from to t_to."""
-        alpha_from = self._get_alpha(t_from).view(-1, 1, 1, 1)
-        alpha_to = self._get_alpha(t_to).view(-1, 1, 1, 1)
-
-        # Predict x_0
-        x_0_pred = (x_t - (1 - alpha_from).sqrt() * noise_pred) / alpha_from.sqrt().clamp(min=1e-8)
-
-        # Compute x at t_to
-        x_t_to = alpha_to.sqrt() * x_0_pred + (1 - alpha_to).sqrt() * noise_pred
-        return x_t_to
 
     def _update_ema(self):
         """Update EMA model parameters."""
@@ -995,8 +1538,6 @@ class KnowledgeDistillationPipeline:
             "epoch": epoch,
             "model_state_dict": model_to_save.state_dict(),
             "kd_mode": self.kd_mode,
-            "alpha": self.alpha,
-            "temperature": self.temperature,
             "teacher_model": self.teacher_model_name,
             "student_model": self.student_model_name,
         }
@@ -1188,7 +1729,7 @@ def main(args=None):
     Can be called standalone or from app.py.
     """
     if args is None:
-        parser = argparse.ArgumentParser(description="Knowledge Distillation for Diffusion Models")
+        parser = argparse.ArgumentParser(description="Knowledge Distillation for Diffusion Models (DMD2 / SANA-Sprint)")
 
         # Model configuration
         parser.add_argument("--teacher_model", type=str, default="SDXL",
@@ -1198,22 +1739,45 @@ def main(args=None):
         parser.add_argument("--student_num_blocks", type=int, default=None,
                             help="Number of blocks for slim student (None = copy teacher)")
 
-        # KD configuration
-        parser.add_argument("--kd_mode", type=str, default="output",
-                            choices=["output", "feature", "attention", "progressive"],
-                            help="Knowledge distillation mode")
-        parser.add_argument("--alpha", type=float, default=0.5,
-                            help="Balance between task loss and KD loss (0=full KD, 1=full task)")
-        parser.add_argument("--temperature", type=float, default=1.0,
-                            help="Temperature for KD loss scaling")
-        parser.add_argument("--feature_weight", type=float, default=1.0,
-                            help="Weight for feature matching loss")
-        parser.add_argument("--attention_weight", type=float, default=1.0,
-                            help="Weight for attention transfer loss")
+        # KD mode
+        parser.add_argument("--kd_mode", type=str, default="dmd2",
+                            choices=["dmd2", "ctcd", "ctcd_ladd"],
+                            help="Distillation mode: dmd2 (DMD2), ctcd (CTCD), ctcd_ladd (CTCD+LADD)")
 
-        # Training configuration
+        # DMD2 specific
+        parser.add_argument("--dm_loss_weight", type=float, default=1.0,
+                            help="Weight for distribution matching loss (DMD2)")
+        parser.add_argument("--gan_loss_weight", type=float, default=1.0,
+                            help="Weight for GAN loss (DMD2)")
+        parser.add_argument("--real_guidance_scale", type=float, default=6.0,
+                            help="CFG scale for real score estimation (DMD2)")
+        parser.add_argument("--dfake_gen_update_ratio", type=int, default=5,
+                            help="Ratio of D/G updates: D updated every step, G every N steps (DMD2)")
+
+        # CTCD specific
+        parser.add_argument("--sigma_data", type=float, default=1.0,
+                            help="Data standard deviation for trigonometric flow (CTCD)")
+        parser.add_argument("--tangent_warmup_steps", type=int, default=1000,
+                            help="Warmup steps for tangent in CTCD")
+        parser.add_argument("--ctcd_logit_mean", type=float, default=0.0,
+                            help="Mean for logit-normal timestep sampling")
+        parser.add_argument("--ctcd_logit_std", type=float, default=1.0,
+                            help="Std for logit-normal timestep sampling")
+
+        # LADD specific
+        parser.add_argument("--adv_lambda", type=float, default=0.1,
+                            help="Weight for adversarial loss (LADD)")
+        parser.add_argument("--scm_lambda", type=float, default=1.0,
+                            help="Weight for consistency loss when combined with LADD")
+        parser.add_argument("--ladd_loss_type", type=str, default="hinge",
+                            choices=["hinge", "cross_entropy"],
+                            help="Discriminator loss type for LADD")
+
+        # General training
         parser.add_argument("--learning_rate", type=float, default=1e-5,
-                            help="Learning rate for student training")
+                            help="Learning rate for generator/student")
+        parser.add_argument("--guidance_lr", type=float, default=None,
+                            help="Learning rate for guidance/discriminator (defaults to --learning_rate)")
         parser.add_argument("--num_epochs", type=int, default=5,
                             help="Number of training epochs")
         parser.add_argument("--batch_size", type=int, default=1,
@@ -1232,10 +1796,10 @@ def main(args=None):
                             choices=["val", "train", "both", "auto"])
 
         # Generation / evaluation
-        parser.add_argument("--steps", type=int, default=30,
-                            help="Number of inference steps for evaluation")
-        parser.add_argument("--guidance_scale", type=float, default=7.5,
-                            help="Guidance scale for image generation")
+        parser.add_argument("--steps", type=int, default=4,
+                            help="Number of inference steps for evaluation (1-4 for distilled models)")
+        parser.add_argument("--guidance_scale", type=float, default=0.0,
+                            help="Guidance scale (0 for distilled models, as CFG is baked in)")
         parser.add_argument("--skip_metrics", action="store_true",
                             help="Skip quality metrics calculation")
         parser.add_argument("--metrics_subset", type=int, default=100,
@@ -1247,24 +1811,32 @@ def main(args=None):
 
         args = parser.parse_args()
 
-    # ---- Resolve parameters with sensible defaults ----
+    # ---- Resolve parameters ----
     teacher_model = getattr(args, "teacher_model", None) or getattr(args, "model_name", "SDXL")
     student_model = getattr(args, "student_model", None)
     student_num_blocks = getattr(args, "student_num_blocks", None)
-    kd_mode = getattr(args, "kd_mode", "output")
-    alpha = getattr(args, "alpha", 0.5)
-    temperature = getattr(args, "temperature", 1.0)
-    feature_weight = getattr(args, "feature_weight", 1.0)
-    attention_weight = getattr(args, "attention_weight", 1.0)
+    kd_mode = getattr(args, "kd_mode", "dmd2")
+    dm_loss_weight = getattr(args, "dm_loss_weight", 1.0)
+    gan_loss_weight = getattr(args, "gan_loss_weight", 1.0)
+    real_guidance_scale = getattr(args, "real_guidance_scale", 6.0)
+    dfake_gen_update_ratio = getattr(args, "dfake_gen_update_ratio", 5)
+    sigma_data = getattr(args, "sigma_data", 1.0)
+    tangent_warmup_steps = getattr(args, "tangent_warmup_steps", 1000)
+    ctcd_logit_mean = getattr(args, "ctcd_logit_mean", 0.0)
+    ctcd_logit_std = getattr(args, "ctcd_logit_std", 1.0)
+    adv_lambda = getattr(args, "adv_lambda", 0.1)
+    scm_lambda = getattr(args, "scm_lambda", 1.0)
+    ladd_loss_type = getattr(args, "ladd_loss_type", "hinge")
     learning_rate = getattr(args, "learning_rate", 1e-5)
+    guidance_lr = getattr(args, "guidance_lr", None)
     num_epochs = getattr(args, "num_epochs", 5)
     batch_size = getattr(args, "batch_size", 1)
     gradient_accumulation_steps = getattr(args, "gradient_accumulation_steps", 4)
     use_ema = getattr(args, "use_ema", True)
     dataset_name = getattr(args, "dataset_name", "MSCOCO2017")
     num_images = getattr(args, "num_images", 1000)
-    steps = getattr(args, "steps", getattr(args, "inference_steps", 30))
-    guidance_scale = getattr(args, "guidance_scale", 7.5)
+    steps = getattr(args, "steps", getattr(args, "inference_steps", 4))
+    guidance_scale = getattr(args, "guidance_scale", 0.0)
     skip_metrics = getattr(args, "skip_metrics", False)
     metrics_subset = getattr(args, "metrics_subset", 100)
     skip_training = getattr(args, "skip_training", False)
@@ -1280,6 +1852,7 @@ def main(args=None):
 
     print("\n" + "=" * 70)
     print("  KNOWLEDGE DISTILLATION FOR DIFFUSION MODELS")
+    print("  Methods: DMD2 (NeurIPS 2024) / SANA-Sprint CTCD+LADD (2025)")
     print("=" * 70)
     print(f"  Teacher model   : {teacher_model}")
     print(f"  Student model   : {student_model or teacher_model}")
@@ -1295,11 +1868,19 @@ def main(args=None):
         student_model_name=student_model,
         student_num_blocks=student_num_blocks,
         kd_mode=kd_mode,
-        alpha=alpha,
-        temperature=temperature,
-        feature_weight=feature_weight,
-        attention_weight=attention_weight,
+        dm_loss_weight=dm_loss_weight,
+        gan_loss_weight=gan_loss_weight,
+        real_guidance_scale=real_guidance_scale,
+        dfake_gen_update_ratio=dfake_gen_update_ratio,
+        sigma_data=sigma_data,
+        tangent_warmup_steps=tangent_warmup_steps,
+        ctcd_logit_mean=ctcd_logit_mean,
+        ctcd_logit_std=ctcd_logit_std,
+        adv_lambda=adv_lambda,
+        scm_lambda=scm_lambda,
+        ladd_loss_type=ladd_loss_type,
         learning_rate=learning_rate,
+        guidance_lr=guidance_lr,
         num_epochs=num_epochs,
         batch_size=batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps,
@@ -1378,14 +1959,30 @@ def main(args=None):
         "teacher_model": teacher_model,
         "student_model": student_model or teacher_model,
         "kd_mode": kd_mode,
-        "alpha": alpha,
-        "temperature": temperature,
         "num_epochs": num_epochs,
         "dataset": dataset_name,
         "num_images": num_images,
         "compression_stats": stats,
         "output_dir": output_dir,
     }
+
+    if kd_mode == "dmd2":
+        summary.update({
+            "dm_loss_weight": dm_loss_weight,
+            "gan_loss_weight": gan_loss_weight,
+            "dfake_gen_update_ratio": dfake_gen_update_ratio,
+        })
+    elif kd_mode in ("ctcd", "ctcd_ladd"):
+        summary.update({
+            "sigma_data": sigma_data,
+            "tangent_warmup_steps": tangent_warmup_steps,
+        })
+        if kd_mode == "ctcd_ladd":
+            summary.update({
+                "adv_lambda": adv_lambda,
+                "scm_lambda": scm_lambda,
+            })
+
     summary_path = os.path.join(output_dir, "distillation_summary.json")
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2)

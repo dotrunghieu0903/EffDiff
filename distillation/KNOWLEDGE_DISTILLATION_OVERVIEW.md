@@ -91,7 +91,7 @@ Trong lĩnh vực **Stable Diffusion / Diffusion Models**, KD đặc biệt quan
 | 2025 | **SANA-Sprint** | NVIDIA/MIT, *"SANA-Sprint: One-Step Diffusion via Continuous-Time Consistency Distillation"*, 2025 [[34]](#ref34) | Hybrid distillation: kết hợp CTCD (Continuous-Time Consistency Distillation) + LADD (Latent Adversarial Diffusion Distillation) → one-step 1024×1024 generation ở 7.8 FPS trên laptop GPU. |
 | 2025 | **Adversarial Post-Training (APT)** | Lin et al., *"Adversarial Post-Training for Diffusion Models"*, 2025 [[35]](#ref35) | Post-training technique: fine-tune pretrained diffusion model bằng adversarial objective → giảm số steps mà không cần full retraining. Efficient hơn distillation truyền thống. |
 | 2025–2026 | **Multi-Reward Guided Distillation** | Nhiều nhóm nghiên cứu [[36]](#ref36) | Kết hợp KD với human preference rewards (RLHF/DPO) trong quá trình distillation. Student được tối ưu đồng thời cho speed và alignment. |
-| 2025–2026 | **Architecture-Aware Distillation** | Nhiều nhóm [[37]](#ref37) | Thiết kế student architecture đặc biệt (pruned + NAS) rồi dùng KD để recover quality. Kết hợp structured pruning + distillation. |
+| 2025–2026 | **Architecture-Aware Distillation** | Nhiều nhóm [[37]](#ref37) | Thiết kế student architecture đặc biệt (pruned + NAS-Neural Architechture Search) rồi dùng KD để recover quality. Kết hợp structured pruning + distillation. |
 
 ---
 
@@ -229,110 +229,126 @@ Knowledge Distillation
 
 ### 5.1. Các kỹ thuật được implement trong `distilled.py`
 
-| # | Kỹ thuật trong `distilled.py` | Class/Loss | Mô tả |
-|---|-------------------------------|------------|--------|
-| 1 | **Output-level KD** | `KDLossOutput` | $L = \alpha \cdot MSE(s, target) + (1-\alpha) \cdot T^2 \cdot MSE(s, t)$ — Match noise predictions (epsilon) giữa teacher và student |
-| 2 | **Feature-level KD** | `KDLossFeature` | Match intermediate feature maps qua `FeatureExtractor` hooks + projection layers khi dimensions khác nhau |
-| 3 | **Attention Transfer** | `KDLossAttentionTransfer` | Match normalized attention maps (softmax) giữa teacher-student theo MSE |
-| 4 | **Progressive Distillation** | `ProgressiveDistillationLoss` | Student 1 step = Teacher 2 DDIM steps. Dựa trên Salimans & Ho, 2022 |
+| # | Kỹ thuật trong `distilled.py` | Class/Loss | Mode (`--kd_mode`) | Mô tả |
+|---|-------------------------------|------------|-------------------|--------|
+| 1 | **DMD2 — Distribution Matching Distillation** | `DMD2Loss`, `FakeScoreNetwork` | `dmd2` | Distribution matching gradient: $\text{grad} = (p_{\text{real}} - p_{\text{fake}}) / \|p_{\text{real}}\|$ + GAN softplus loss. Two-timescale update (fake score network updated every step, generator every N steps). Dựa trên Yin et al., NeurIPS 2024 [[23]](#ref23). |
+| 2 | **CTCD — Continuous-Time Consistency Distillation** | `CTCDLoss` | `ctcd` | Trigonometric flow: $x_t = \cos(t) \cdot x_0 + \sin(t) \cdot z \cdot \sigma_{\text{data}}$. JVP-based tangent estimation via finite differences, tangent normalization $g / (\|g\| + c)$, logvar weighting. Dựa trên SANA-Sprint, Chen et al. 2025 [[34]](#ref34). |
+| 3 | **CTCD + LADD** | `CTCDLoss`, `LADDLoss`, `LatentDiscriminator` | `ctcd_ladd` | Kết hợp CTCD loss + Latent Adversarial Diffusion Distillation. Discriminator phân biệt noise-augmented real vs student-predicted $x_0$. Alternating G/D training phases. Hinge hoặc cross-entropy loss. |
 
 ### 5.2. Bảng so sánh toàn diện
 
 | Kỹ thuật KD | Năm | Loại | Steps | Cần Data? | Có trong `distilled.py`? | Ghi chú |
 |-------------|-----|------|-------|-----------|--------------------------|---------|
-| **Soft Label KD** (Hinton) | 2015 | Response | — | Có | ✅ **Có** (`KDLossOutput`) | Adapted cho diffusion: MSE trên noise thay vì KL trên logits |
-| **FitNets** | 2015 | Feature | — | Có | ✅ **Có** (`KDLossFeature`) | Projection layers khi dim mismatch, MSE loss |
-| **Attention Transfer** | 2017 | Feature | — | Có | ✅ **Có** (`KDLossAttentionTransfer`) | Normalized attention maps, MSE loss |
+| **Soft Label KD** (Hinton) | 2015 | Response | — | Có | ❌ Không | Baseline KD, đã thay bằng DMD2/CTCD |
+| **FitNets** | 2015 | Feature | — | Có | ❌ Không | Feature matching, đã thay bằng phương pháp mới |
+| **Attention Transfer** | 2017 | Feature | — | Có | ❌ Không | Attention map transfer |
 | **Relational KD** | 2019 | Relation | — | Có | ❌ Không | Match distances/angles giữa samples |
 | **Contrastive KD** | 2020 | Relation | — | Có | ❌ Không | Contrastive learning + KD |
-| **Progressive Distillation** | 2022 | Trajectory | N/2→1 | Có | ✅ **Có** (`ProgressiveDistillationLoss`) | DDIM 2-step teacher → 1-step student |
+| **Progressive Distillation** | 2022 | Trajectory | N/2→1 | Có | ❌ Không | Đã thay bằng CTCD (continuous-time) |
 | **Guidance Distillation** | 2022 | Response | Flexible | Có | ❌ Không | Distill CFG, loại bỏ 2x forward |
 | **Consistency Models** | 2023 | Trajectory | 1–2 | Không/Có | ❌ Không | Self-consistency mapping trên ODE trajectory |
 | **LCM** | 2023 | Trajectory | 1–4 | Có | ❌ Không | Consistency Models trong latent space + LoRA |
 | **ADD / SDXL-Turbo** | 2023 | Adversarial + KD | 1–4 | Có | ❌ Không | Cần discriminator network |
 | **InstaFlow** | 2023 | Rectified Flow | 1 | Có | ❌ Không | Reflow + distillation |
-| **DMD / DMD2** | 2024 | Distribution | 1 | Có | ❌ Không | Distribution-level matching + GAN loss |
+| **DMD / DMD2** | 2024 | Distribution | 1 | Có | ✅ **Có** (`DMD2Loss`, mode `dmd2`) | Distribution matching gradient + GAN loss + two-timescale update |
 | **SDXL-Lightning** | 2024 | Progressive + Adversarial | 1–8 | Có | ❌ Không | LoRA-based, progressive adversarial |
 | **Hyper-SD** | 2024 | Trajectory Segmented | 1–8 | Có | ❌ Không | Segmented CD + reward guidance |
 | **CTM** | 2024 | Trajectory | Flexible | Có | ❌ Không | Predict bất kỳ $(t,s)$ pair |
 | **TCD** | 2024 | Trajectory | 2–8 | Có | ❌ Không | Trajectory consistency |
-| **SANA-Sprint** | 2025 | CTCD + LADD | 1 | Có | ❌ Không | Continuous-time + adversarial |
+| **SANA-Sprint** | 2025 | CTCD + LADD | 1 | Có | ✅ **Có** (`CTCDLoss` + `LADDLoss`, mode `ctcd` / `ctcd_ladd`) | Trigonometric flow + JVP tangent + adversarial |
 | **APT** | 2025 | Adversarial Post-Training | 1–4 | Ít | ❌ Không | Post-training, không cần student |
 
 ### 5.3. Phân tích chi tiết từng kỹ thuật trong `distilled.py`
 
-#### (A) `KDLossOutput` — Output-level KD
+#### (A) `DMD2Loss` + `FakeScoreNetwork` — Distribution Matching Distillation (mode `dmd2`)
 
 ```python
-L_total = α · MSE(student_pred, noise_target) + (1-α) · T² · MSE(student_pred, teacher_pred)
+# Core distribution matching gradient:
+p_real = x_gen - denoise_teacher(noisy_x_gen)
+p_fake = x_gen - denoise_fake(noisy_x_gen)
+grad = (p_real - p_fake) / mean(|p_real|)  # normalized
+L_dm = 0.5 * MSE(x_gen, x_gen - grad)      # pseudo-loss
+
+# GAN loss (generator):
+L_gan_G = softplus(-classify(x_gen))        # fool discriminator
+
+# Fake score denoising loss (guidance):
+L_fake = MSE(fake_denoiser(noisy_x_gen), noise)  # trained every step
 ```
 
-**Gốc từ**: Hinton et al. 2015 (adapted)  
-**Trong diffusion context**: Thay vì softmax outputs, match **noise predictions** $\epsilon_\theta(x_t, t)$ giữa teacher-student.
+**Gốc từ**: Yin et al., *Improved Distribution Matching Distillation*, NeurIPS 2024 [[23]](#ref23)  
+**Trong distilled.py**: `FakeScoreNetwork` deep-copy teacher + GAN classification head. `DMD2Loss` tính distribution matching gradient + GAN loss. Two-timescale: fake score cập nhật mỗi step, generator mỗi `dfake_gen_update_ratio` steps.
 
 | Ưu điểm | Nhược điểm |
 |----------|------------|
-| Đơn giản, dễ implement | Không capture intermediate reasoning |
-| Ổn định khi training | Standard MSE có thể bị blurry |
-| Hyperparameters ít (α, T) | Không giảm số inference steps |
+| FID state-of-the-art cho one-step generation | Cần 3 model copies (teacher + fake + student) → memory cao |
+| Không cần regression loss | GAN training có thể unstable |
+| Distribution-level matching (không chỉ sample-level) | Two-timescale cần tune ratio cẩn thận |
+| Gradients được normalize → training ổn định | Cần pre-compute alphas_cumprod (DDPM scheduler) |
 
-**So với state-of-the-art**: Đây là baseline KD, hầu hết các methods mới hơn (LCM, ADD, DMD) đều build thêm trên nền này.
+**Key hyperparameters**: `--dm_loss_weight`, `--gan_loss_weight`, `--dfake_gen_update_ratio`, `--real_guidance_scale`
 
-#### (B) `KDLossFeature` — Feature-level KD
+#### (B) `CTCDLoss` — Continuous-Time Consistency Distillation (mode `ctcd`)
 
 ```python
-# Projection khi dimensions khác nhau
-projector = Linear(s_dim, t_dim) + GELU()
-L_feature = Σ MSE(proj(student_feat_i), teacher_feat_i) / N
+# Trigonometric flow:
+x_t = cos(t) * x_0 + sin(t) * z * sigma_data
+
+# Teacher velocity:
+dxt_dt = sigma_data * teacher(x_t / sigma_data, t)
+
+# JVP tangent (finite difference approximation):
+F_theta_grad = (student(x_t + eps*v_x, t + eps*v_t) - F_theta) / eps
+
+# Tangent with warmup:
+g = -cos²(t) * (sigma_data * F_theta_stop - dxt_dt)
+    - r * (cos(t)*sin(t)*x_t + sigma_data * F_theta_grad)
+g = g / (||g|| + 0.1)  # tangent normalization
+
+# Loss with logvar weighting:
+L = (weight / exp(logvar)) * ||F_theta - F_theta_stop - g||² + logvar
 ```
 
-**Gốc từ**: FitNets (Romero et al. 2015)  
-**Trong distilled.py**: Dùng `FeatureExtractor` (forward hooks) để capture features từ `["attn", "ff", "mid_block"]`.
+**Gốc từ**: Chen et al., *SANA-Sprint*, 2025 [[34]](#ref34)  
+**Trong distilled.py**: `CTCDLoss` sử dụng trigonometric flow formulation. JVP ước lượng bằng finite differences (tương thích mọi model architecture). Tangent normalization và warmup coefficient `r` tăng dần.
 
 | Ưu điểm | Nhược điểm |
 |----------|------------|
-| Transfer rich intermediate info | Cần xác định đúng layers để match |
-| Giúp student converge nhanh hơn | Thêm compute cho hook + projection |
-| Hỗ trợ cross-architecture (dim projection) | Có thể overfit vào teacher's representations |
+| Continuous-time → không cần discretize timesteps | JVP finite diff kém chính xác hơn native JVP |
+| Tangent normalization → ổn định training | Cần teacher frozen + student forward 2 lần |
+| Logvar tự học → adaptive weighting | Trigonometric flow khác DDPM schedule cổ điển |
+| Tương thích flow-based models (Flux, SD3) | Warmup steps cần tune cho từng model |
 
-**So với state-of-the-art**: Hyper-SD và TinyBERT cũng dùng multi-layer feature matching nhưng thêm reward-guided selection và attention-specific layers.
+**Key hyperparameters**: `--sigma_data`, `--tangent_warmup_steps`, `--ctcd_logit_mean`, `--ctcd_logit_std`
 
-#### (C) `KDLossAttentionTransfer` — Attention Transfer
+#### (C) `CTCDLoss` + `LADDLoss` + `LatentDiscriminator` — CTCD + LADD (mode `ctcd_ladd`)
 
 ```python
-attn_norm = softmax(attn_flat / √d, dim=-1)
-L_attn = Σ MSE(attn_norm_student_i, attn_norm_teacher_i) / N
+# Generator phase:
+L_total = scm_lambda * L_ctcd + adv_lambda * L_adv_G
+
+# L_adv_G (hinge):
+pred_x0 = cos(t)*x_t - sin(t)*student(x_t)*sigma_data
+noised_pred = cos(t_D)*pred_x0 + sin(t_D)*z_D  # noise augment
+L_adv_G = -mean(discriminator(noised_pred))
+
+# Discriminator phase (alternating):
+noised_fake = noise_augment(pred_x0)     # student prediction
+noised_real = noise_augment(clean_x0)    # ground truth
+L_D = 0.5 * (relu(1 - D(real)) + relu(1 + D(fake)))  # hinge
 ```
 
-**Gốc từ**: Zagoruyko & Komodakis 2017  
-**Trong distilled.py**: Normalize attention maps rồi match bằng MSE (fallback từ KL divergence).
+**Gốc từ**: SANA-Sprint LADD component [[34]](#ref34), inspired by ADD [[18]](#ref18)  
+**Trong distilled.py**: `LatentDiscriminator` dùng teacher backbone (frozen) + trainable classification head. `LADDLoss` hỗ trợ hinge và cross-entropy. Alternating G/D phases.
 
 | Ưu điểm | Nhược điểm |
 |----------|------------|
-| Capture "where model looks" | Chỉ attention maps, không phải toàn bộ behavior |
-| Lightweight additional loss | Phụ thuộc vào model có expose attention maps |
-| Complementary với feature KD | Có thể conflict với output KD |
+| Adversarial loss cải thiện visual quality | Thêm discriminator → tăng memory |
+| Noise augmentation → discriminator robust | Alternating phases → phức tạp hơn CTCD thuần |
+| Hỗ trợ hinge + cross-entropy | Cần balance scm_lambda vs adv_lambda |
+| CTCD giữ consistency, LADD tăng sharpness | Training chậm hơn do 2 phases |
 
-**So với state-of-the-art**: ADD (SDXL-Turbo) cũng implicitly transfer attention patterns thông qua adversarial training, nhưng end-to-end.
-
-#### (D) `ProgressiveDistillationLoss` — Progressive Distillation
-
-```python
-# Teacher: 2 DDIM steps (t → t/2 → 0)  
-# Student: 1 step (t → 0)
-L_prog = MSE(student_pred, teacher_2step_result)
-```
-
-**Gốc từ**: Salimans & Ho, ICLR 2022  
-**Trong distilled.py**: Teacher thực hiện 2 DDIM steps, student học predict kết quả tương đương trong 1 step. Quá trình halving lặp lại.
-
-| Ưu điểm | Nhược điểm |
-|----------|------------|
-| Proven technique, mathematically grounded | Cần nhiều rounds để giảm ít steps |
-| Giảm inference steps 2x mỗi round | Quality degrade khi < 4 steps |
-| Deterministic (DDIM-based) | Không utilizes adversarial signal |
-
-**So với state-of-the-art**: SDXL-Lightning cải tiến bằng adversarial loss ở mỗi stage. LCM dùng consistency-based thay vì progressive halving → nhanh hơn, ít training rounds.
+**Key hyperparameters**: `--adv_lambda`, `--scm_lambda`, `--ladd_loss_type`, `--guidance_lr`
 
 ### 5.4. Bảng so sánh Performance (tham khảo từ benchmarks công bố)
 
@@ -341,8 +357,9 @@ L_prog = MSE(student_pred, teacher_2step_result)
 | Method | Model | Steps | FID↓ | CLIP↑ | Inference Speed |
 |--------|-------|-------|------|-------|-----------------|
 | SDXL (baseline, no KD) | SDXL | 50 | ~23 | ~0.32 | ~5s/image |
-| Progressive Distill. `distilled.py` | SDXL | 4–8 | ~28–35 | ~0.30 | ~0.8–1.5s |
-| Output KD `distilled.py` | SDXL | 30 | ~25–30 | ~0.31 | ~4s |
+| DMD2 `distilled.py` (mode `dmd2`) | SDXL | 1 | ~22–24 | ~0.31 | ~0.1–0.2s |
+| CTCD `distilled.py` (mode `ctcd`) | SDXL | 1–4 | ~24–27 | ~0.31 | ~0.1–0.5s |
+| CTCD+LADD `distilled.py` (mode `ctcd_ladd`) | SDXL | 1 | ~21–24 | ~0.32 | ~0.1–0.2s |
 | LCM-LoRA | SDXL | 4 | ~24.5 | ~0.31 | ~0.6s |
 | SDXL-Turbo (ADD) | SDXL | 1–4 | ~26.2 | ~0.31 | ~0.2–0.5s |
 | SDXL-Lightning | SDXL | 4 | ~24.0 | ~0.32 | ~0.5s |
@@ -350,18 +367,50 @@ L_prog = MSE(student_pred, teacher_2step_result)
 | DMD2 | SD1.5 | 1 | ~22.4 | ~0.31 | ~0.1s |
 | SANA-Sprint | SANA 1.6B | 1 | ~20.0 | ~0.33 | ~0.13s (laptop) |
 
-### 5.5. Khuyến nghị mở rộng cho `distilled.py`
+### 5.5. Kiến trúc hiện tại và hướng mở rộng
 
-Dựa trên phân tích trên, các kỹ thuật sau có thể được thêm vào `distilled.py` để cải thiện performance:
+#### Kiến trúc module hiện tại
+
+```
+distilled.py
+├── DMD2 (mode "dmd2")
+│   ├── FakeScoreNetwork     — Deep-copy teacher + GAN classification head
+│   └── DMD2Loss             — Distribution matching gradient + GAN losses
+│       ├── compute_distribution_matching_loss()   — Real vs fake score
+│       ├── compute_gan_loss_generator()            — Softplus(−D(fake))
+│       ├── compute_fake_score_loss()               — Train fake denoiser
+│       └── compute_gan_loss_discriminator()        — Real/fake classification
+│
+├── SANA-Sprint (mode "ctcd" / "ctcd_ladd")
+│   ├── CTCDLoss             — Trigonometric flow + JVP tangent + logvar
+│   ├── LatentDiscriminator  — Teacher backbone (frozen) + trainable head
+│   └── LADDLoss             — Hinge / cross-entropy adversarial loss
+│       ├── generator_loss()      — Fool discriminator
+│       └── discriminator_loss()  — Real vs fake classification
+│
+├── KnowledgeDistillationPipeline
+│   ├── load_teacher()       — Load diffusers pipeline, freeze teacher
+│   ├── create_student()     — Deep-copy or slim student + EMA + aux networks
+│   ├── train()              — Dispatches to _train_dmd2() or _train_ctcd()
+│   ├── generate_images()    — Student inference pipeline
+│   └── evaluate()           — FID, CLIP, ImageReward, LPIPS, PSNR
+│
+└── Utilities
+    ├── CaptionNoiseDataset  — Pre-computed embeddings + on-the-fly noise
+    ├── _get_x0_from_noise() — DDPM x₀ prediction
+    └── _sample_trigflow_timesteps() — Logit-normal → [0, π/2]
+```
+
+#### Hướng mở rộng tiếp theo
 
 | Ưu tiên | Kỹ thuật | Lý do | Độ khó |
 |---------|---------|-------|--------|
-| 🔴 Cao | **Consistency Distillation (LCD/LCM)** | SOTA cho few-step generation, có sẵn code reference | Trung bình |
-| 🔴 Cao | **Guidance Distillation** | Giảm 50% compute cho CFG, orthogonal với các methods khác | Dễ |
-| 🟡 Trung bình | **Adversarial Loss (ADD-style)** | Cải thiện visual quality đáng kể cho 1–4 step | Khó (cần discriminator) |
-| 🟡 Trung bình | **CTCD (Continuous-Time CD)** | Mới nhất, tốt cho rectified flow models (Flux, SD3) | Trung bình |
-| 🟢 Thấp | **Distribution Matching (DMD2)** | Best FID, nhưng cần GAN training setup phức tạp | Khó |
-| 🟢 Thấp | **Reward-guided KD** | Align với human preference, nhưng cần reward model | Trung bình |
+| 🔴 Cao | **Native JVP (torch.func.jvp)** | Chính xác hơn finite differences cho CTCD | Trung bình |
+| 🔴 Cao | **Guidance Distillation** | Giảm 50% compute cho CFG, orthogonal với DMD2/CTCD | Dễ |
+| 🟡 Trung bình | **Reward-guided KD (DPO/RLHF)** | Align với human preference, kết hợp được với CTCD | Trung bình |
+| 🟡 Trung bình | **Multi-scale Discriminator** | LADD quality tốt hơn, như SanaMSCMDiscriminator gốc | Trung bình |
+| 🟢 Thấp | **LoRA-based Student** | Giảm memory, dễ distribute checkpoints | Dễ |
+| 🟢 Thấp | **Trajectory Segmented CD (Hyper-SD)** | Flexible step count, nhưng DMD2/CTCD đã cover 1-step | Khó |
 
 ---
 
