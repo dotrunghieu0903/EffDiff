@@ -147,12 +147,71 @@ def calculate_fid_subset(generated_image_dir, resized_generated_image_dir, origi
         #     shutil.rmtree(temp_dir)
         pass
 
+# Helper function: Normalize Image Reward scores
+def normalize_image_reward_score(score, method='none'):
+    """
+    Normalize ImageReward scores to different ranges.
+    
+    ImageReward follows ~N(0,1) distribution (standard normal).
+    Flickr8K typically has mean ~1.0, COCO has mean ~0.3
+    
+    Args:
+        score: Raw ImageReward score
+        method: Normalization method
+            - 'none': Return as-is (default)
+            - 'sigmoid': Apply sigmoid to get [0, 1] range
+            - 'tanh': Apply tanh to get [0, 1] range (smoother)
+            - 'clamp': Clamp to [-2, 2] range (most use case)
+            - 'zscore': Subtract mean and divide by std (creates N(0,1))
+    
+    Returns:
+        Normalized score
+    """
+    if method == 'none':
+        return score
+    elif method == 'sigmoid':
+        # sigmoid: converts to [0, 1]
+        return 1.0 / (1.0 + np.exp(-score))
+    elif method == 'tanh':
+        # tanh: smoother conversion to [0, 1]
+        return (np.tanh(score) + 1.0) / 2.0
+    elif method == 'clamp':
+        # clamp to [-2, 2] then scale to [0, 1]
+        return (np.clip(score, -2, 2) + 2) / 4.0
+    elif method == 'zscore':
+        # Using ImageReward's built-in normalization params
+        mean_ir = 0.16717362830052426
+        std_ir = 1.0333394966054072
+        return (score - mean_ir) / std_ir
+    else:
+        raise ValueError(f"Unknown normalization method: {method}")
+
 # Calculate Image Reward
-def compute_image_reward(generated_dirpath, captions_dict):
+def compute_image_reward(generated_dirpath, captions_dict, normalize_method='none', return_all_scores=False):
+    """
+    Compute Image Reward scores for generated images.
+    
+    Args:
+        generated_dirpath: Directory containing generated images
+        captions_dict: Dictionary mapping filenames to captions
+        normalize_method: How to normalize scores ('none', 'sigmoid', 'tanh', 'clamp')
+        return_all_scores: If True, return list of all scores instead of average
+    
+    Returns:
+        Average score (float) or list of scores (if return_all_scores=True)
+        
+    Notes:
+        - ImageReward scores follow ~N(0,1) distribution
+        - Flickr8K captions typically give mean score ~1.0+ (high quality captions)
+        - COCO captions typically give mean score ~0.3 (more generic captions)
+        - Scores > 1.0 are NORMAL and indicate good caption-image alignment
+    """
     scores = []
     try:
         model = RM.load("ImageReward-v1.0")
         print("ImageReward model loaded.")
+        print(f"  Model normalization: mean={model.mean:.4f}, std={model.std:.4f}")
+        
         # Filter captions_dict to only include filenames for which images were successfully generated
         generated_files = [f for f in os.listdir(generated_dirpath) if os.path.isfile(os.path.join(generated_dirpath, f))]
         filtered_captions = {filename: prompt for filename, prompt in captions_dict.items() if filename in generated_files}
@@ -162,24 +221,41 @@ def compute_image_reward(generated_dirpath, captions_dict):
             return None
 
         print(f"Calculating Image Reward for {len(filtered_captions)} images...")
+        if normalize_method != 'none':
+            print(f"  Using normalization method: {normalize_method}")
 
         for filename, prompt in filtered_captions.items():
             path = os.path.join(generated_dirpath, filename)
             try:
                 with torch.inference_mode():
                     score = model.score(prompt, path)
+                
+                # Apply normalization if requested
+                if normalize_method != 'none':
+                    score = normalize_image_reward_score(score, normalize_method)
+                
                 scores.append(score)
                 #print(f"Image Reward for {filename} (Prompt: {prompt[:50]}...): {score:.4f}")
             except Exception as e:
                 print(f"Error when computing Image Reward for {filename}: {e}")
                 scores.append(None) # Append None to indicate failure
 
-        # Calculate average score, excluding None values from errors
+        # Calculate statistics
         valid_scores = [s for s in scores if s is not None]
         if valid_scores:
             average_score = sum(valid_scores) / len(valid_scores)
-            print(f"Average Image Reward Score: {average_score:.4f}")
-            return average_score
+            
+            if return_all_scores:
+                print(f"Average Image Reward Score: {average_score:.4f}")
+                print(f"Valid scores: {len(valid_scores)}/{len(scores)}")
+                return valid_scores
+            else:
+                print(f"Average Image Reward Score: {average_score:.4f}")
+                print(f"  Min: {min(valid_scores):.4f}, Max: {max(valid_scores):.4f}")
+                print(f"  Valid scores: {len(valid_scores)}/{len(scores)}")
+                if normalize_method != 'none':
+                    print(f"  Note: Scores normalized using '{normalize_method}' method")
+                return average_score
         else:
             print("No valid Image Reward scores could be computed.")
             return None
@@ -278,9 +354,9 @@ def calculate_lpips(original_dir, generated_dir, filenames):
                     img1 = img1.cuda()
                     img2 = img2.cuda()
 
-                # Calculate LPIPS
+                # Calculate LPIPS using [0,1] input normalization
                 with torch.no_grad():
-                    score = loss_fn_alex(img1, img2)
+                    score = loss_fn_alex(img1, img2, normalize=True)
                 lpips_scores.append(score.item())
 
             except Exception as e:
