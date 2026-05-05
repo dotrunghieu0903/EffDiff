@@ -28,6 +28,104 @@ import copy
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Any
 
+# ============================================================================
+#  Compatibility patches (referenced from quantization/quantized.py)
+# ============================================================================
+
+# Fix compatibility issues with newer versions of dependencies
+try:
+    from transformers.modeling_utils import apply_chunking_to_forward
+except ImportError:
+    try:
+        from transformers.utils import apply_chunking_to_forward
+    except ImportError:
+        def apply_chunking_to_forward(forward_fn, chunk_size, chunk_dim, *input_tensors):
+            return forward_fn(*input_tensors)
+        import transformers.modeling_utils
+        transformers.modeling_utils.apply_chunking_to_forward = apply_chunking_to_forward
+
+# Fix huggingface_hub compatibility issues
+try:
+    from huggingface_hub.constants import HF_HOME
+except ImportError:
+    try:
+        from huggingface_hub import constants
+        if not hasattr(constants, 'HF_HOME'):
+            constants.HF_HOME = os.path.expanduser("~/.cache/huggingface")
+            import huggingface_hub.constants
+            huggingface_hub.constants.HF_HOME = constants.HF_HOME
+    except Exception as e:
+        print(f"Warning: Could not set up HF_HOME compatibility: {e}")
+
+# Fix DDUFEntry import issue
+try:
+    from huggingface_hub import DDUFEntry
+except ImportError:
+    class DDUFEntry:
+        def __init__(self, *args, **kwargs):
+            pass
+    import huggingface_hub
+    huggingface_hub.DDUFEntry = DDUFEntry
+
+# Fix missing functions in huggingface_hub for transformers/diffusers compatibility
+import huggingface_hub
+try:
+    from huggingface_hub import split_torch_state_dict_into_shards
+    huggingface_hub.split_torch_state_dict_into_shards = split_torch_state_dict_into_shards
+except ImportError:
+    def split_torch_state_dict_into_shards(state_dict, *args, **kwargs):
+        return {}, {'pytorch_model.bin': list(state_dict.keys())}
+    huggingface_hub.split_torch_state_dict_into_shards = split_torch_state_dict_into_shards
+
+try:
+    import transformers.modeling_utils
+    transformers.modeling_utils.split_torch_state_dict_into_shards = huggingface_hub.split_torch_state_dict_into_shards
+except ImportError:
+    pass
+
+try:
+    import transformers.generation.utils
+    transformers.generation.utils.split_torch_state_dict_into_shards = huggingface_hub.split_torch_state_dict_into_shards
+except ImportError:
+    pass
+
+try:
+    import transformers
+    if not hasattr(transformers, 'split_torch_state_dict_into_shards'):
+        transformers.split_torch_state_dict_into_shards = huggingface_hub.split_torch_state_dict_into_shards
+except ImportError:
+    pass
+
+# Fix missing read_dduf_file function in huggingface_hub
+try:
+    from huggingface_hub import read_dduf_file
+    huggingface_hub.read_dduf_file = read_dduf_file
+except ImportError:
+    def read_dduf_file(file_path, *args, **kwargs):
+        with open(file_path, 'rb') as f:
+            return f.read()
+    huggingface_hub.read_dduf_file = read_dduf_file
+
+# Patch at sys.modules level
+if 'transformers.generation.utils' in sys.modules:
+    sys.modules['transformers.generation.utils'].split_torch_state_dict_into_shards = huggingface_hub.split_torch_state_dict_into_shards
+if 'transformers.modeling_utils' in sys.modules:
+    sys.modules['transformers.modeling_utils'].split_torch_state_dict_into_shards = huggingface_hub.split_torch_state_dict_into_shards
+
+# Fix cached_download function name change
+try:
+    from huggingface_hub import cached_download
+except ImportError:
+    try:
+        from huggingface_hub import hf_hub_download as cached_download
+        huggingface_hub.cached_download = cached_download
+    except ImportError:
+        pass
+
+# ============================================================================
+#  End compatibility patches
+# ============================================================================
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -87,9 +185,13 @@ class FakeScoreNetwork(nn.Module):
     features.
     """
 
-    def __init__(self, teacher_denoiser: nn.Module, model_type: str, device: str):
+    def __init__(self, teacher_denoiser: nn.Module, model_type: str, device: str,
+                 deepcopy_fn=None):
         super().__init__()
-        self.fake_denoiser = copy.deepcopy(teacher_denoiser)
+        if deepcopy_fn is not None:
+            self.fake_denoiser = deepcopy_fn(teacher_denoiser)
+        else:
+            self.fake_denoiser = copy.deepcopy(teacher_denoiser)
         self.fake_denoiser.requires_grad_(True)
         self.model_type = model_type
 
@@ -453,9 +555,13 @@ class LatentDiscriminator(nn.Module):
     the teacher denoiser backbone (frozen) with a small trainable head.
     """
 
-    def __init__(self, backbone: nn.Module, latent_channels: int, device: str):
+    def __init__(self, backbone: nn.Module, latent_channels: int, device: str,
+                 deepcopy_fn=None):
         super().__init__()
-        self.backbone = copy.deepcopy(backbone)
+        if deepcopy_fn is not None:
+            self.backbone = deepcopy_fn(backbone)
+        else:
+            self.backbone = copy.deepcopy(backbone)
         self.backbone.requires_grad_(False)
         self.backbone.eval()
 
@@ -710,6 +816,7 @@ class KnowledgeDistillationPipeline:
         gradient_accumulation_steps: int = 4,
         use_ema: bool = True,
         ema_decay: float = 0.9999,
+        memory_efficient: bool = False,
         device: str = "cuda",
     ):
         self.teacher_model_name = teacher_model_name
@@ -743,6 +850,7 @@ class KnowledgeDistillationPipeline:
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.use_ema = use_ema
         self.ema_decay = ema_decay
+        self.memory_efficient = memory_efficient
         self.device = device
 
         # Will be filled during load
@@ -807,6 +915,47 @@ class KnowledgeDistillationPipeline:
         print(f"  Teacher size   : {teacher_size:.1f} MB")
         print(f"  Teacher params : {teacher_params:,}")
 
+    # ------------------------------------------------------------------
+    # Memory-efficient offloading helpers
+    # ------------------------------------------------------------------
+
+    def _offload_to_cpu(self, model: nn.Module, name: str = ""):
+        """Move model to CPU and free GPU cache."""
+        if model is not None:
+            model.to("cpu")
+            torch.cuda.empty_cache()
+            if name:
+                print(f"    [mem] {name} -> CPU")
+
+    def _load_to_gpu(self, model: nn.Module, name: str = ""):
+        """Move model to GPU."""
+        if model is not None:
+            model.to(self.device)
+            if name:
+                print(f"    [mem] {name} -> GPU")
+
+    def _load_fresh_denoiser(self) -> nn.Module:
+        """Load a fresh copy of the denoiser by re-loading from pretrained weights.
+        Used when copy.deepcopy fails (e.g. quantized nunchaku models)."""
+        models = self.config.get("models", {})
+        model_info = models.get(self.teacher_model_name, {})
+        model_path = model_info.get("path", self.teacher_model_name)
+        print(f"  Loading fresh denoiser from {model_path}...")
+        pipeline = self._load_pipeline(model_path, self.model_type)
+        denoiser = self._get_denoiser(pipeline)
+        # Release the rest of the pipeline to save memory
+        del pipeline
+        free_memory()
+        return denoiser
+
+    def _safe_deepcopy_denoiser(self, model: nn.Module) -> nn.Module:
+        """Try deepcopy first; if it fails (e.g. quantized model), load a fresh copy."""
+        try:
+            return copy.deepcopy(model)
+        except (TypeError, RuntimeError) as e:
+            print(f"  deepcopy failed ({e}), loading fresh model instead...")
+            return self._load_fresh_denoiser()
+
     def create_student(self):
         """
         Create the student model. Strategy depends on configuration:
@@ -821,14 +970,14 @@ class KnowledgeDistillationPipeline:
             self.student_denoiser = self._create_slim_student(self.student_num_blocks)
         else:
             # Start from a copy of the teacher
-            self.student_denoiser = copy.deepcopy(self.teacher_denoiser)
+            self.student_denoiser = self._safe_deepcopy_denoiser(self.teacher_denoiser)
             self.student_denoiser.train()
             for p in self.student_denoiser.parameters():
                 p.requires_grad = True
 
         # Create EMA copy
         if self.use_ema:
-            self.ema_model = copy.deepcopy(self.student_denoiser)
+            self.ema_model = self._safe_deepcopy_denoiser(self.student_denoiser)
             self.ema_model.eval()
             for p in self.ema_model.parameters():
                 p.requires_grad = False
@@ -838,27 +987,55 @@ class KnowledgeDistillationPipeline:
         print(f"  Student size   : {student_size:.1f} MB")
         print(f"  Student params : {student_params:,}")
         print(f"  EMA enabled    : {self.use_ema}")
+        print(f"  Memory efficient: {self.memory_efficient}")
+
+        # Memory-efficient: offload teacher to CPU before creating more models
+        if self.memory_efficient:
+            self._offload_to_cpu(self.teacher_denoiser, "teacher")
+            free_memory()
 
         # Create mode-specific auxiliary networks
         if self.kd_mode == "dmd2":
             print("  Creating Fake Score Network (DMD2)...")
             self.fake_score_net = FakeScoreNetwork(
                 self.teacher_denoiser, self.model_type, self.device,
-            ).to(self.device)
+                deepcopy_fn=self._safe_deepcopy_denoiser,
+            )
+            if not self.memory_efficient:
+                self.fake_score_net = self.fake_score_net.to(self.device)
+            else:
+                # Keep on CPU, will be moved to GPU when needed
+                self.fake_score_net = self.fake_score_net.to("cpu")
+                print("    [mem] fake_score_net -> CPU")
 
         if self.kd_mode == "ctcd_ladd":
             print("  Creating Latent Discriminator (LADD)...")
             latent_ch = 4 if self.model_type == "sdxl" else 16
             self.discriminator = LatentDiscriminator(
                 self.teacher_denoiser, latent_ch, self.device,
-            ).to(self.device)
+                deepcopy_fn=self._safe_deepcopy_denoiser,
+            )
+            if not self.memory_efficient:
+                self.discriminator = self.discriminator.to(self.device)
+            else:
+                self.discriminator = self.discriminator.to("cpu")
+                print("    [mem] discriminator -> CPU")
+
+        # Memory-efficient: EMA always on CPU
+        if self.memory_efficient and self.use_ema and self.ema_model is not None:
+            self._offload_to_cpu(self.ema_model, "ema_model")
+
+        if self.memory_efficient:
+            free_memory()
+            vram_used = torch.cuda.memory_allocated() / (1024**3)
+            print(f"  [mem] GPU VRAM used after setup: {vram_used:.1f} GB")
 
     def _create_slim_student(self, num_blocks: int) -> nn.Module:
         """
         Create a smaller student by removing transformer/UNet blocks.
         This works by selecting every N-th block to keep.
         """
-        student = copy.deepcopy(self.teacher_denoiser)
+        student = self._safe_deepcopy_denoiser(self.teacher_denoiser)
 
         if self.model_type == "sdxl":
             if hasattr(student, "down_blocks"):
@@ -894,42 +1071,75 @@ class KnowledgeDistillationPipeline:
         return student
 
     def _load_pipeline(self, model_path: str, model_type: str):
-        """Load the appropriate diffusers pipeline for the model type."""
+        """Load the appropriate diffusers pipeline for the model type.
+        
+        NOTE: Distillation requires full-precision models (not quantized int4)
+        because the denoiser must be deepcopy-able for student/EMA/fake-score
+        networks, and quantized nunchaku models cannot be pickled.
+
+        Loading strategy per model type (referenced from quantization/quantized.py):
+        - SDXL: float16 + variant="fp16" + use_safetensors
+        - Flux: bfloat16 + use_safetensors
+        - SD3:  float16 + use_safetensors
+        - SANA: bfloat16 + use_safetensors
+        """
         from diffusers import (
             StableDiffusionXLPipeline,
             FluxPipeline,
             StableDiffusion3Pipeline,
         )
 
-        common_kwargs = dict(torch_dtype=torch.float16, use_safetensors=True)
-
         if model_type == "sdxl":
+            print(f"  Loading SDXL pipeline (float16)...")
             pipeline = StableDiffusionXLPipeline.from_pretrained(
-                model_path, variant="fp16", **common_kwargs
+                model_path,
+                torch_dtype=torch.float16,
+                use_safetensors=True,
+                variant="fp16",
             )
+
         elif model_type == "flux":
+            print(f"  Loading Flux pipeline (bfloat16)...")
             pipeline = FluxPipeline.from_pretrained(
-                model_path, torch_dtype=torch.bfloat16
+                model_path,
+                torch_dtype=torch.bfloat16,
+                use_safetensors=True,
             )
+
         elif model_type == "sd3":
+            print(f"  Loading SD3 pipeline (float16)...")
             pipeline = StableDiffusion3Pipeline.from_pretrained(
-                model_path, **common_kwargs
+                model_path,
+                torch_dtype=torch.float16,
+                use_safetensors=True,
             )
+
         elif model_type == "sana":
             try:
                 from diffusers import SanaPipeline
-                pipeline = SanaPipeline.from_pretrained(model_path, **common_kwargs)
+                print(f"  Loading SANA pipeline (bfloat16)...")
+                pipeline = SanaPipeline.from_pretrained(
+                    model_path,
+                    torch_dtype=torch.bfloat16,
+                    use_safetensors=True,
+                )
             except ImportError:
                 print("  SanaPipeline not available, falling back to SDXL loader")
                 pipeline = StableDiffusionXLPipeline.from_pretrained(
-                    model_path, variant="fp16", **common_kwargs
+                    model_path,
+                    torch_dtype=torch.float16,
+                    use_safetensors=True,
+                    variant="fp16",
                 )
         else:
+            print(f"  Loading default SDXL pipeline (float16)...")
             pipeline = StableDiffusionXLPipeline.from_pretrained(
-                model_path, variant="fp16", **common_kwargs
+                model_path,
+                torch_dtype=torch.float16,
+                use_safetensors=True,
+                variant="fp16",
             )
 
-        pipeline = pipeline.to(self.device)
         pipeline.enable_model_cpu_offload()
         return pipeline
 
@@ -1106,11 +1316,18 @@ class KnowledgeDistillationPipeline:
         self.teacher_denoiser.eval()
         self.student_denoiser.to(self.device)
 
+        # Memory-efficient: enable gradient checkpointing on student
+        if self.memory_efficient:
+            if hasattr(self.student_denoiser, 'enable_gradient_checkpointing'):
+                self.student_denoiser.enable_gradient_checkpointing()
+                print("  [mem] Gradient checkpointing enabled on student")
+
         for epoch in range(self.num_epochs):
             epoch_loss = 0.0
             epoch_metrics = {}
             self.student_denoiser.train()
-            self.fake_score_net.train()
+            if not self.memory_efficient:
+                self.fake_score_net.train()
 
             pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{self.num_epochs}")
             for step, (noise, timesteps_raw, embeds, pooled) in enumerate(pbar):
@@ -1146,6 +1363,11 @@ class KnowledgeDistillationPipeline:
 
                 # Step 2: Generator update (DM + GAN loss)
                 if is_generator_step:
+                    # Memory-efficient: bring teacher + fake_score to GPU for DM loss
+                    if self.memory_efficient:
+                        self._load_to_gpu(self.teacher_denoiser)
+                        self._load_to_gpu(self.fake_score_net)
+
                     # Distribution matching loss
                     loss_dm, dm_metrics = dmd2_loss.compute_distribution_matching_loss(
                         generated_latents, self.teacher_denoiser,
@@ -1155,10 +1377,18 @@ class KnowledgeDistillationPipeline:
                         self.device, forward_kwargs,
                     )
 
-                    # GAN loss for generator
+                    # Memory-efficient: teacher no longer needed, offload
+                    if self.memory_efficient:
+                        self._offload_to_cpu(self.teacher_denoiser)
+
+                    # GAN loss for generator (only needs fake_score_net, already on GPU)
                     loss_gan_g, gan_g_metrics = dmd2_loss.compute_gan_loss_generator(
                         generated_latents, self.fake_score_net,
                     )
+
+                    # Memory-efficient: offload fake_score_net after generator step
+                    if self.memory_efficient:
+                        self._offload_to_cpu(self.fake_score_net)
 
                     gen_loss = (loss_dm + loss_gan_g) / self.gradient_accumulation_steps
                     gen_loss.backward()
@@ -1179,6 +1409,11 @@ class KnowledgeDistillationPipeline:
                     metrics = {}
 
                 # Step 3: Guidance/discriminator update (every step)
+                # Memory-efficient: bring fake_score_net to GPU for its update
+                if self.memory_efficient:
+                    self._load_to_gpu(self.fake_score_net)
+                    self.fake_score_net.train()
+
                 # Fake score denoising loss
                 loss_fake, fake_metrics = dmd2_loss.compute_fake_score_loss(
                     generated_latents, self.fake_score_net,
@@ -1194,6 +1429,10 @@ class KnowledgeDistillationPipeline:
                     optimizer_D.step()
                     optimizer_D.zero_grad()
                     optimizer_G.zero_grad()
+
+                # Memory-efficient: offload fake_score_net after its update
+                if self.memory_efficient:
+                    self._offload_to_cpu(self.fake_score_net)
 
                 metrics.update(fake_metrics)
                 for k, v in metrics.items():
@@ -1312,6 +1551,12 @@ class KnowledgeDistillationPipeline:
         self.teacher_denoiser.eval()
         self.student_denoiser.to(self.device)
 
+        # Memory-efficient: enable gradient checkpointing on student
+        if self.memory_efficient:
+            if hasattr(self.student_denoiser, 'enable_gradient_checkpointing'):
+                self.student_denoiser.enable_gradient_checkpointing()
+                print("  [mem] Gradient checkpointing enabled on student")
+
         for epoch in range(self.num_epochs):
             epoch_loss = 0.0
             epoch_metrics = {}
@@ -1339,8 +1584,13 @@ class KnowledgeDistillationPipeline:
 
                 if phase == "G":
                     if use_ladd and self.discriminator is not None:
-                        self.discriminator.eval()
+                        if not self.memory_efficient:
+                            self.discriminator.eval()
                     self.student_denoiser.train()
+
+                    # Memory-efficient: bring teacher to GPU for CTCD loss
+                    if self.memory_efficient:
+                        self._load_to_gpu(self.teacher_denoiser)
 
                     # CTCD loss
                     ctcd_l, ctcd_m = ctcd_loss_fn(
@@ -1349,10 +1599,19 @@ class KnowledgeDistillationPipeline:
                         global_step, model_kwargs,
                     )
 
+                    # Memory-efficient: offload teacher after CTCD
+                    if self.memory_efficient:
+                        self._offload_to_cpu(self.teacher_denoiser)
+
                     total_loss = self.scm_lambda * ctcd_l
 
                     # LADD adversarial loss for generator
                     if use_ladd and self.discriminator is not None:
+                        # Memory-efficient: bring discriminator to GPU
+                        if self.memory_efficient:
+                            self._load_to_gpu(self.discriminator)
+                            self.discriminator.eval()
+
                         t_view = timesteps.view(-1, 1, 1, 1)
                         x_t = torch.cos(t_view) * clean_images + torch.sin(t_view) * noise * sd
 
@@ -1377,6 +1636,10 @@ class KnowledgeDistillationPipeline:
                         total_loss = total_loss + adv_l
                         ctcd_m.update(adv_m)
 
+                        # Memory-efficient: offload discriminator
+                        if self.memory_efficient:
+                            self._offload_to_cpu(self.discriminator)
+
                     total_loss = total_loss / self.gradient_accumulation_steps
                     total_loss.backward()
 
@@ -1400,6 +1663,10 @@ class KnowledgeDistillationPipeline:
                     epoch_loss += total_loss.item() * self.gradient_accumulation_steps
 
                 elif phase == "D" and use_ladd and self.discriminator is not None:
+                    # Memory-efficient: bring discriminator to GPU
+                    if self.memory_efficient:
+                        self._load_to_gpu(self.discriminator)
+
                     self.discriminator.train()
                     self.student_denoiser.eval()
 
@@ -1435,6 +1702,10 @@ class KnowledgeDistillationPipeline:
                         optimizer_G.zero_grad()
                         phase = "G"
                         global_step += 1
+
+                    # Memory-efficient: offload discriminator
+                    if self.memory_efficient:
+                        self._offload_to_cpu(self.discriminator)
 
                     metrics = d_metrics
                 else:
@@ -1523,9 +1794,10 @@ class KnowledgeDistillationPipeline:
         return output
 
     def _update_ema(self):
-        """Update EMA model parameters."""
+        """Update EMA model parameters. Works even when EMA is on CPU."""
         for ema_p, student_p in zip(self.ema_model.parameters(), self.student_denoiser.parameters()):
-            ema_p.data.mul_(self.ema_decay).add_(student_p.data, alpha=1 - self.ema_decay)
+            # Move student param to same device as EMA for the update
+            ema_p.data.mul_(self.ema_decay).add_(student_p.data.to(ema_p.device), alpha=1 - self.ema_decay)
 
     def _save_checkpoint(self, output_dir: str, epoch: int, is_best: bool = False, is_final: bool = False):
         """Save model checkpoint."""
@@ -1790,7 +2062,7 @@ def main(args=None):
         # Dataset configuration
         parser.add_argument("--dataset_name", type=str, default="MSCOCO2017",
                             help="Dataset name: MSCOCO2017 or Flickr8k")
-        parser.add_argument("--num_images", type=int, default=1000,
+        parser.add_argument("--num_images", type=int, default=10000,
                             help="Number of captions to use for training")
         parser.add_argument("--coco_splits", type=str, default="auto",
                             choices=["val", "train", "both", "auto"])
@@ -1808,6 +2080,9 @@ def main(args=None):
                             help="Skip training, only run evaluation with existing checkpoint")
         parser.add_argument("--checkpoint_path", type=str, default=None,
                             help="Path to existing student checkpoint to load")
+        parser.add_argument("--memory_efficient", action="store_true",
+                            help="Enable memory-efficient mode: offload teacher/EMA/fakescore to CPU between steps. "
+                                 "Slower but fits in ~15GB VRAM for SDXL DMD2.")
 
         args = parser.parse_args()
 
@@ -1834,13 +2109,14 @@ def main(args=None):
     gradient_accumulation_steps = getattr(args, "gradient_accumulation_steps", 4)
     use_ema = getattr(args, "use_ema", True)
     dataset_name = getattr(args, "dataset_name", "MSCOCO2017")
-    num_images = getattr(args, "num_images", 1000)
+    num_images = getattr(args, "num_images", 10000)
     steps = getattr(args, "steps", getattr(args, "inference_steps", 4))
     guidance_scale = getattr(args, "guidance_scale", 0.0)
     skip_metrics = getattr(args, "skip_metrics", False)
     metrics_subset = getattr(args, "metrics_subset", 100)
     skip_training = getattr(args, "skip_training", False)
     checkpoint_path = getattr(args, "checkpoint_path", None)
+    memory_efficient = getattr(args, "memory_efficient", False)
 
     # ---- Output directory ----
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1859,6 +2135,7 @@ def main(args=None):
     print(f"  KD mode         : {kd_mode}")
     print(f"  Dataset         : {dataset_name}")
     print(f"  Num images      : {num_images}")
+    print(f"  Memory efficient: {memory_efficient}")
     print(f"  Output dir      : {output_dir}")
     print()
 
@@ -1885,6 +2162,7 @@ def main(args=None):
         batch_size=batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps,
         use_ema=use_ema,
+        memory_efficient=memory_efficient,
     )
 
     # ---- Load teacher ----
